@@ -65,12 +65,19 @@ jobs:
       - name: Build Release APK (arm64-v8a)
         run: flutter build apk --release --target-platform android-arm64 --verbose
 
-      # --- 上传产物 ---
+      # --- 上传产物：用通配符覆盖所有可能路径 ---
+      - name: Find APK files
+        run: |
+          find build/app/outputs -name "*.apk" -type f | head -20
+          ls -la build/app/outputs/flutter-apk/ 2>/dev/null || true
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-arm64-v8a-release
-          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/app/outputs/apk/**/*.apk
           retention-days: 30
 
       # --- 可选：自动创建 Release 并挂载 APK (需先建 tag) ---
