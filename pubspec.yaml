@@ -1,0 +1,41 @@
+name: live_translate
+description: 实时同传 - 端侧离线英日双语实时翻译悬浮窗应用
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # UI & 基础
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.3.3
+  provider: ^6.1.5
+  permission_handler: ^11.4.0
+  path_provider: ^2.1.4
+
+  # 端侧 ASR: sherpa-onnx (流式 Zipformer + Silero VAD)
+  sherpa_onnx: ^1.13.8
+
+  # 端侧翻译: llama.cpp Dart 绑定 + Hy-MT1.5 GGUF
+  llama_cpp_dart: ^0.9.0-dev.12
+
+  # 悬浮窗: 独立 Isolate + 原生层渲染
+  flutter_screen_overlay: ^1.0.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/models/
