@@ -160,7 +160,55 @@ live_translate/
 
 ---
 
+## 9. 🚀 GitHub CI 部署指南 (当前会话新增)
+
+### 本地 Git 仓库状态
+```bash
+# 当前已初始化 Git 仓库并完成首次提交
+cd /data/user/0/com.ai.assistance.operit/files/workspace/live_translate
+git log --oneline -1
+# db03813 fix: Gradle/AGP compatibility + code analysis fixes
+```
+
+### 推送到 GitHub 并触发 CI 构建
+```bash
+# 1. 关联远程仓库 (需替换为实际 GitHub 仓库地址)
+git remote add origin https://github.com/your-username/live_translate.git
+
+# 2. 推送主分支
+git push -u origin main
+
+# 3. 创建并推送版本标签触发 Release 构建
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### GitHub Actions 配置状态
+| 配置项 | 状态 | 说明 |
+|--------|------|------|
+| `.github/workflows/build_and_release.yml` | ✅ 已就绪 | 触发条件：推送 `v*` 标签或手动触发 |
+| Java 17 强制 | ✅ 已配置 | `actions/setup-java@v4` temurin 17 |
+| Flutter 3.44.0 | ✅ 已配置 | `flutter-actions/setup-flutter@v4` |
+| Gradle 缓存 | ✅ 已配置 | 加速后续构建 |
+| 代码分析步骤 | ✅ 已配置 | `flutter analyze` |
+| 测试步骤 | ✅ 已配置 | `flutter test` |
+| Release APK 构建 | ✅ 已配置 | `flutter build apk --release --split-per-abi` |
+| Release 发布 | ✅ 已配置 | `softprops/action-gh-release@v2` |
+
+### ⚠️ 需在 GitHub 仓库 Settings → Secrets and variables → Actions 中配置
+| Secret 名称 | 用途 | 当前状态 |
+|-------------|------|----------|
+| `GITHUB_TOKEN` | 自动发布 Release | ✅ 自动可用 (仓库级) |
+| `KEYSTORE_BASE64` | 签名密钥库 Base64 | ❌ **待配置** (当前用 debug 签名) |
+| `KEYSTORE_PASSWORD` | 密钥库密码 | ❌ **待配置** |
+| `KEY_ALIAS` | 密钥别名 | ❌ **待配置** |
+| `KEY_PASSWORD` | 密钥密码 | ❌ **待配置** |
+
+> **注意**：未配置签名密钥时，Workflow 使用 debug 签名构建，生成的 APK 仅供测试，不适合生产分发。正式发布前需配置上述 4 个签名 Secret。
+
+---
+
 **文档生成时间**：2024-11-24  
-**文档更新时间**：2024-11-24 (修复 Gradle/AGP 兼容性、代码分析通过、全测试通过)  
+**文档更新时间**：2024-11-24 (修复 Gradle/AGP 兼容性、代码分析通过、全测试通过、Git 仓库就绪)  
 **当前分支**：main  
-**下一任务入口**：`flutter run --release` 真机跑完整链路（音频捕获 + Mock ASR/MT + 悬浮窗）
+**下一任务入口**：关联 GitHub 远程仓库 → 推送 main 分支 → 推送 `v0.1.0` 标签触发 CI 自动构建发布
