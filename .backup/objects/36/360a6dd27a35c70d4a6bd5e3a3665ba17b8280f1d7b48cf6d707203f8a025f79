@@ -1,0 +1,189 @@
+/// 快捷设置磁贴实现
+/// 使用 quick_settings_with_flutter_plugins 绑定系统快捷设置面板
+/// 控制翻译服务的全局开关
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:quick_settings_with_flutter_plugins/quick_settings_with_flutter_plugins.dart';
+// ignore: unused_import
+import 'package:system_audio_recorder/system_audio_recorder.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+
+/// 磁贴服务类，管理快捷设置磁贴的生命周期和状态同步
+class QuickSettingsTileService {
+  static final QuickSettingsTileService _instance = QuickSettingsTileService._internal();
+  factory QuickSettingsTileService() => _instance;
+  QuickSettingsTileService._internal();
+  
+  // 磁贴状态
+  static const String _tileId = 'live_translate_tile';
+  bool _isTileActive = false;
+  bool _isServiceBound = false;
+  
+  // 回调引用
+  TranslationService? _translationService;
+  VoidCallback? _onStateChanged;
+  
+  /// 初始化磁贴服务
+  Future<void> initialize({
+    required TranslationService translationService,
+    required VoidCallback onStateChanged,
+  }) async {
+    _translationService = translationService;
+    _onStateChanged = onStateChanged;
+    
+    // 监听服务状态变化
+    translationService.addListener(_onTranslationServiceChanged);
+    
+    // 注册磁贴
+    await _registerTile();
+    
+    debugPrint('[QuickSettingsTile] Initialized');
+  }
+  
+  /// 注册快捷设置磁贴
+  Future<void> _registerTile() async {
+    try {
+      await QuickSettingsWithFlutterPlugins.registerTile(
+        tileId: _tileId,
+        label: '实时翻译',
+        icon: 'ic_tile_icon', // 需要在 Android res/drawable 中定义
+        onClick: _onTileClick,
+        onLongClick: _onTileLongClick,
+      );
+      _isServiceBound = true;
+      debugPrint('[QuickSettingsTile] Tile registered');
+    } catch (e, stack) {
+      debugPrint('[QuickSettingsTile] Registration failed: $e\n$stack');
+      _isServiceBound = false;
+    }
+  }
+  
+  /// 磁贴点击回调：切换服务状态
+  Future<void> _onTileClick() async {
+    debugPrint('[QuickSettingsTile] Tile clicked');
+    
+    if (_translationService == null) {
+      debugPrint('[QuickSettingsTile] Translation service not available');
+      return;
+    }
+    
+    try {
+      // 检查悬浮窗权限（Android 15+ 要求）
+      if (!_translationService!.isServiceRunning) {
+        final hasOverlayPermission = await _checkOverlayPermission();
+        if (!hasOverlayPermission) {
+          // 权限不足，发送高优先级通知引导用户
+          await _showPermissionNotification();
+          await _updateTileState(active: false);
+          return;
+        }
+      }
+      
+      // 切换服务
+      await _translationService!.toggleService();
+      
+      // 更新磁贴状态
+      await _updateTileState(active: _translationService!.isServiceRunning);
+      
+      // 触发 UI 刷新
+      _onStateChanged?.call();
+    } catch (e, stack) {
+      debugPrint('[QuickSettingsTile] Toggle failed: $e\n$stack');
+      await _updateTileState(active: false);
+    }
+  }
+  
+  /// 磁贴长按回调：打开主应用
+  Future<void> _onTileLongClick() async {
+    debugPrint('[QuickSettingsTile] Tile long clicked');
+    // 这里可以启动主 Activity
+    // 实际实现需要通过 MethodChannel 调用原生代码
+  }
+  
+  /// 翻译服务状态变化监听
+  void _onTranslationServiceChanged() {
+    if (_translationService == null) return;
+    
+    _updateTileState(active: _translationService!.isServiceRunning);
+    _onStateChanged?.call();
+  }
+  
+  /// 更新磁贴状态（图标、标签、激活状态）
+  Future<void> _updateTileState({required bool active}) async {
+    if (!_isServiceBound) return;
+    
+    _isTileActive = active;
+    
+    try {
+      await QuickSettingsWithFlutterPlugins.updateTile(
+        tileId: _tileId,
+        active: active,
+        label: active ? '实时翻译 (运行中)' : '实时翻译',
+        // 可以根据状态切换图标
+        // icon: active ? 'ic_tile_active' : 'ic_tile_icon',
+      );
+      debugPrint('[QuickSettingsTile] State updated: active=$active');
+    } catch (e, stack) {
+      debugPrint('[QuickSettingsTile] Update state failed: $e\n$stack');
+    }
+  }
+  
+  /// 检查悬浮窗权限
+  Future<bool> _checkOverlayPermission() async {
+    try {
+      // 通过 MethodChannel 调用原生检查
+      const channel = MethodChannel('live_translate/permissions');
+      final result = await channel.invokeMethod<bool>('checkOverlayPermission');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('[QuickSettingsTile] Permission check failed: $e');
+      return false;
+    }
+  }
+  
+  /// 显示权限引导通知（高优先级）
+  Future<void> _showPermissionNotification() async {
+    try {
+      const channel = MethodChannel('live_translate/permissions');
+      await channel.invokeMethod('showOverlayPermissionNotification');
+    } catch (e) {
+      debugPrint('[QuickSettingsTile] Show notification failed: $e');
+    }
+  }
+  
+  /// 手动刷新磁贴状态（应用启动时调用）
+  Future<void> refreshTileState() async {
+    if (_translationService != null) {
+      await _updateTileState(active: _translationService!.isServiceRunning);
+    }
+  }
+  
+  /// 释放资源
+  Future<void> dispose() async {
+    _translationService?.removeListener(_onTranslationServiceChanged);
+    _translationService = null;
+    _onStateChanged = null;
+    
+    try {
+      await QuickSettingsWithFlutterPlugins.unregisterTile(tileId: _tileId);
+      _isServiceBound = false;
+    } catch (e) {
+      debugPrint('[QuickSettingsTile] Unregister failed: $e');
+    }
+    
+    debugPrint('[QuickSettingsTile] Disposed');
+  }
+  
+  /// 获取当前磁贴状态
+  bool get isTileActive => _isTileActive;
+  bool get isServiceBound => _isServiceBound;
+}
+
+/// 磁贴状态变化通知混入（供主 UI 使用）
+mixin QuickSettingsTileNotifier on ChangeNotifier {
+  QuickSettingsTileService get tileService => QuickSettingsTileService();
+  
+  void notifyTileStateChanged() {
+    notifyListeners();
+  }
+}

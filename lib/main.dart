@@ -1,0 +1,306 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
+import 'package:provider/provider.dart';
+import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+import 'package:live_translate/core/tile/quick_settings_tile.dart';
+import 'package:live_translate/ui/main_screen.dart';
+
+void main() {
+  // 确保 Flutter 绑定初始化
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // 设置 QuickSettings 回调（必须在 runApp 之前调用）
+  QuickSettings.setup(
+    onTileClicked: onTileClicked,
+    onTileAdded: onTileAdded,
+    onTileRemoved: onTileRemoved,
+  );
+  
+  runApp(const LiveTranslateApp());
+}
+
+class LiveTranslateApp extends StatefulWidget {
+  const LiveTranslateApp({super.key});
+  
+  @override
+  State<LiveTranslateApp> createState() => _LiveTranslateAppState();
+}
+
+class _LiveTranslateAppState extends State<LiveTranslateApp> {
+  late final TranslationService _translationService;
+  late final QuickSettingsTileService _tileService;
+  bool _isInitialized = false;
+  String? _initError;
+  
+  @override
+  void initState() {
+    super.initState();
+    _translationService = TranslationService();
+    _tileService = QuickSettingsTileService();
+    _initializeApp();
+  }
+  
+  Future<void> _initializeApp() async {
+    try {
+      // 初始化翻译服务（注册并启动 Mock 引擎）
+      await _translationService.initialize();
+      
+      // 初始化快捷设置磁贴
+      await _tileService.initialize(
+        translationService: _translationService,
+        onStateChanged: () {
+          if (mounted) setState(() {});
+        },
+      );
+      
+      if (mounted) {
+        setState(() {
+          _isInitialized = true;
+        });
+      }
+    } catch (e, stack) {
+      debugPrint('[LiveTranslateApp] Initialization error: $e\n$stack');
+      if (mounted) {
+        setState(() {
+          _initError = e.toString();
+          _isInitialized = true; // 仍然显示 UI，但会显示错误
+        });
+      }
+    }
+  }
+  
+  @override
+  void dispose() {
+    _translationService.dispose();
+    _tileService.dispose();
+    super.dispose();
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    // 初始化期间显示加载界面
+    if (!_isInitialized) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: '实时翻译',
+        theme: _buildDarkTheme(),
+        home: const _LoadingScreen(),
+      );
+    }
+    
+    // 初始化失败显示错误界面
+    if (_initError != null) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: '实时翻译',
+        theme: _buildDarkTheme(),
+        home: _ErrorScreen(error: _initError!, onRetry: _initializeApp),
+      );
+    }
+    
+    // 正常运行
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: _translationService),
+      ],
+      child: MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: '实时翻译',
+        theme: _buildDarkTheme(),
+        home: const MainScreen(),
+      ),
+    );
+  }
+  
+  ThemeData _buildDarkTheme() {
+    return ThemeData(
+      brightness: Brightness.dark,
+      useMaterial3: true,
+      colorScheme: const ColorScheme.dark(
+        primary: Color(0xFF00B0FF),
+        secondary: Color(0xFF00E5A0),
+        surface: Color(0xFF1E1E1E),
+        background: Color(0xFF121212),
+        error: Colors.redAccent,
+        onPrimary: Colors.white,
+        onSecondary: Colors.black,
+        onSurface: Colors.white,
+        onBackground: Colors.white,
+        onError: Colors.white,
+      ),
+      scaffoldBackgroundColor: const Color(0xFF121212),
+      cardTheme: CardThemeData(
+        color: const Color(0xFF1E1E1E),
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: Colors.white10),
+        ),
+        margin: EdgeInsets.zero,
+      ),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF00B0FF),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: const Color(0xFF2A2A2A),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: Colors.white10),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFF00B0FF), width: 2),
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      ),
+      dividerTheme: DividerThemeData(
+        color: Colors.white10,
+        thickness: 1,
+        space: 1,
+      ),
+      tooltipTheme: TooltipThemeData(
+        decoration: BoxDecoration(
+          color: const Color(0xFF2A2A2A),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        textStyle: const TextStyle(color: Colors.white, fontSize: 12),
+        preferBelow: false,
+      ),
+    );
+  }
+}
+
+/// 加载界面
+class _LoadingScreen extends StatelessWidget {
+  const _LoadingScreen();
+  
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF121212),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: const Icon(
+                Icons.translate_rounded,
+                color: Colors.blue,
+                size: 48,
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              '实时翻译',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 28,
+                fontWeight: FontWeight.w700,
+                letterSpacing: -0.5,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '正在初始化引擎...',
+              style: TextStyle(
+                color: Colors.grey[400],
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 32),
+            const CircularProgressIndicator(
+              valueColor: AlwaysStoppedAnimation<Color>(Colors.blue),
+              strokeWidth: 3,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 错误界面
+class _ErrorScreen extends StatelessWidget {
+  final String error;
+  final VoidCallback onRetry;
+  
+  const _ErrorScreen({required this.error, required this.onRetry});
+  
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF121212),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Icon(
+                  Icons.error_outline_rounded,
+                  color: Colors.redAccent,
+                  size: 48,
+                ),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                '初始化失败',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 24,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2A2A2A),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  error,
+                  style: TextStyle(
+                    color: Colors.redAccent[200],
+                    fontSize: 13,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('重试'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

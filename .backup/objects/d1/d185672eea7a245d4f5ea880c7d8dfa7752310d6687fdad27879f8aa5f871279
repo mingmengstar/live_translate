@@ -1,0 +1,364 @@
+/// 翻译服务
+/// 协调 ASR 和 MT 引擎，处理完整的音频 -> 文本 -> 翻译 流程
+/// 使用 Provider 进行状态管理
+import 'dart:async';
+import 'dart:developer';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_screen_overlay/flutter_screen_overlay.dart';
+import 'package:live_translate/core/engine/engine.dart';
+
+class TranslationService extends ChangeNotifier {
+  final EngineManager _engineManager = EngineManager();
+  
+  // 状态
+  bool _isServiceRunning = false;
+  String _statusMessage = '就绪';
+  String? _lastError;
+  
+  // 字幕缓冲区（用于悬浮窗显示）
+  final List<SubtitleEntry> _subtitleBuffer = [];
+  static const int _maxSubtitleEntries = 50;
+  
+  // 防抖定时器（悬浮窗更新节流 100ms）
+  Timer? _debounceTimer;
+  String _pendingSourceText = '';
+  String _pendingTranslatedText = '';
+  bool _pendingIsFinal = false;
+  
+  // 当前识别的临时文本（用于显示中间结果）
+  String _currentPartialText = '';
+  String _currentTranslatedPartial = '';
+  
+  // 语言设置
+  String _asrLanguage = 'en';
+  String _mtSourceLang = 'en';
+  String _mtTargetLang = 'ja';
+  
+  // 获取器
+  bool get isServiceRunning => _isServiceRunning;
+  String get statusMessage => _statusMessage;
+  String? get lastError => _lastError;
+  List<SubtitleEntry> get subtitleBuffer => List.unmodifiable(_subtitleBuffer);
+  String get currentPartialText => _currentPartialText;
+  String get currentTranslatedPartial => _currentTranslatedPartial;
+  String get asrLanguage => _asrLanguage;
+  String get mtSourceLang => _mtSourceLang;
+  String get mtTargetLang => _mtTargetLang;
+  EngineManager get engineManager => _engineManager;
+  
+  /// 初始化服务：注册 Mock 引擎
+  Future<void> initialize() async {
+    _updateStatus('正在初始化引擎...');
+    
+    // 注册 Mock 引擎
+    _engineManager.registerASREngine('mock_asr', () => MockASR());
+    _engineManager.registerMTEngine('mock_mt', () => MockMT());
+    
+    // 切换到 Mock 引擎
+    final asrOk = await _engineManager.switchASREngine(
+      engineId: 'mock_asr',
+      config: {'language': _asrLanguage},
+    );
+    
+    final mtOk = await _engineManager.switchMTEngine(
+      engineId: 'mock_mt',
+      config: {
+        'sourceLang': _mtSourceLang,
+        'targetLang': _mtTargetLang,
+      },
+    );
+    
+    if (asrOk && mtOk) {
+      _updateStatus('引擎就绪 (Mock 模式)');
+      _lastError = null;
+    } else {
+      _lastError = '引擎初始化失败';
+      _updateStatus('初始化失败');
+    }
+    
+    // 监听引擎变更
+    _engineManager.addListener(_onEngineChanged);
+  }
+  
+  void _onEngineChanged(EngineTypeEnum engineType, String? engineId) {
+    final typeStr = engineType == EngineTypeEnum.asr ? 'ASR' : 'MT';
+    _updateStatus(engineId != null ? '$typeStr 引擎已切换: $engineId' : '$typeStr 引擎已停止');
+    notifyListeners();
+  }
+  
+  /// 启动翻译服务
+  Future<void> startService() async {
+    if (_isServiceRunning) return;
+    
+    _updateStatus('正在启动服务...');
+    _clearError();
+    
+    try {
+      // 启动 ASR
+      await _engineManager.startASR(
+        onResult: _onASRResult,
+        onError: _onASRError,
+      );
+      
+      _isServiceRunning = true;
+      _subtitleBuffer.clear();
+      _updateStatus('服务运行中...');
+      notifyListeners();
+    } catch (e, stack) {
+      _lastError = '启动失败: $e';
+      _updateStatus('启动失败');
+      log('TranslationService start error: $e\n$stack', name: 'TranslationService');
+      notifyListeners();
+    }
+  }
+  
+  /// 停止翻译服务
+  Future<void> stopService() async {
+    if (!_isServiceRunning) return;
+    
+    _updateStatus('正在停止服务...');
+    
+    try {
+      await _engineManager.stopASR();
+      _isServiceRunning = false;
+      _currentPartialText = '';
+      _currentTranslatedPartial = '';
+      _debounceTimer?.cancel();
+      _updateStatus('服务已停止');
+      notifyListeners();
+    } catch (e, stack) {
+      _lastError = '停止失败: $e';
+      _updateStatus('停止失败');
+      debugPrint('TranslationService stop error: $e\n$stack');
+      notifyListeners();
+    }
+  }
+  
+  /// 切换服务运行状态
+  Future<void> toggleService() async {
+    if (_isServiceRunning) {
+      await stopService();
+    } else {
+      await startService();
+    }
+  }
+  
+  /// 推送音频数据到 ASR
+  Future<void> pushAudio(List<int> audioData) async {
+    if (!_isServiceRunning) return;
+    await _engineManager.pushAudioToASR(audioData);
+  }
+  
+  /// ASR 结果回调
+  void _onASRResult(ASRResult result) {
+    log('[TranslationService] ASR: ${result.text} (final: ${result.isFinal})', name: 'TranslationService');
+    
+    // 更新当前部分文本
+    _currentPartialText = result.text;
+    
+    if (result.isFinal) {
+      // 最终结果：触发翻译
+      _currentPartialText = '';
+      _translateText(result.text);
+    } else {
+      // 中间结果：直接显示（不翻译，避免频繁调用 MT）
+      notifyListeners();
+    }
+  }
+  
+  /// ASR 错误回调
+  void _onASRError(Object error, StackTrace stack) {
+    _lastError = 'ASR 错误: $error';
+    _updateStatus('ASR 出错');
+    log('[TranslationService] ASR Error: $error\n$stack', name: 'TranslationService');
+    notifyListeners();
+  }
+  
+  /// 翻译文本
+  Future<void> _translateText(String text) async {
+    if (text.trim().isEmpty) return;
+    
+    try {
+      await _engineManager.translateStreamWithMT(
+        text: text,
+        onChunk: (chunk) {
+          _currentTranslatedPartial = chunk.text;
+          
+          // 防抖更新悬浮窗（100ms 节流）
+          _scheduleDebouncedUpdate(
+            sourceText: text,
+            translatedText: chunk.text,
+            isFinal: chunk.isFinal,
+          );
+        },
+        onComplete: (result) {
+          _currentTranslatedPartial = '';
+          _addSubtitleEntry(
+            sourceText: result.sourceText,
+            translatedText: result.translatedText,
+            isFinal: true,
+          );
+        },
+        onError: (error, stack) {
+          _lastError = '翻译错误: $error';
+          _currentTranslatedPartial = '';
+          log('[TranslationService] MT Error: $error\n$stack', name: 'TranslationService');
+          notifyListeners();
+        },
+      );
+    } catch (e, stack) {
+      _lastError = '翻译启动失败: $e';
+      log('[TranslationService] Translate error: $e\n$stack', name: 'TranslationService');
+      notifyListeners();
+    }
+  }
+  
+  /// 调度防抖更新（100ms 节流，避免高频渲染崩溃）
+  void _scheduleDebouncedUpdate({
+    required String sourceText,
+    required String translatedText,
+    required bool isFinal,
+  }) {
+    _pendingSourceText = sourceText;
+    _pendingTranslatedText = translatedText;
+    _pendingIsFinal = isFinal;
+    
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 100), () {
+      _addSubtitleEntry(
+        sourceText: _pendingSourceText,
+        translatedText: _pendingTranslatedText,
+        isFinal: _pendingIsFinal,
+      );
+      // 通过 FlutterScreenOverlay.shareData() 发送给悬浮窗
+      _sendToOverlay();
+    });
+  }
+  
+  /// 添加字幕条目到缓冲区
+  void _addSubtitleEntry({
+    required String sourceText,
+    required String translatedText,
+    required bool isFinal,
+  }) {
+    final entry = SubtitleEntry(
+      sourceText: sourceText,
+      translatedText: translatedText,
+      timestamp: DateTime.now(),
+      isFinal: isFinal,
+      sourceLang: _mtSourceLang,
+      targetLang: _mtTargetLang,
+    );
+    
+    _subtitleBuffer.insert(0, entry);
+    
+    // 限制缓冲区大小
+    if (_subtitleBuffer.length > _maxSubtitleEntries) {
+      _subtitleBuffer.removeRange(_maxSubtitleEntries, _subtitleBuffer.length);
+    }
+    
+    notifyListeners();
+  }
+  
+  /// 发送数据到悬浮窗（通过 FlutterScreenOverlay.shareData）
+  void _sendToOverlay() {
+    try {
+      FlutterScreenOverlay.shareData({
+        'sourceText': _pendingSourceText,
+        'translatedText': _pendingTranslatedText,
+        'isFinal': _pendingIsFinal,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      });
+      log('[Overlay] Sent: source="$_pendingSourceText", translated="$_pendingTranslatedText"', name: 'TranslationService');
+    } catch (e) {
+      log('[Overlay] Send failed: $e', name: 'TranslationService');
+    }
+  }
+  
+  /// 切换 ASR 语言
+  Future<void> setASRLanguage(String language) async {
+    _asrLanguage = language;
+    await _engineManager.switchASRLanguage(language);
+    notifyListeners();
+  }
+  
+  /// 切换 MT 语言对
+  Future<void> setMTLanguagePair(String sourceLang, String targetLang) async {
+    _mtSourceLang = sourceLang;
+    _mtTargetLang = targetLang;
+    await _engineManager.switchMTLanguagePair(sourceLang, targetLang);
+    notifyListeners();
+  }
+  
+  /// 切换引擎（用于后续接入真实引擎）
+  Future<bool> switchASREngine(String engineId, {Map<String, dynamic> config = const {}}) async {
+    _updateStatus('正在切换 ASR 引擎...');
+    final ok = await _engineManager.switchASREngine(
+      engineId: engineId,
+      config: {'language': _asrLanguage, ...config},
+    );
+    if (ok) _updateStatus('ASR 引擎已切换: $engineId');
+    return ok;
+  }
+  
+  Future<bool> switchMTEngine(String engineId, {Map<String, dynamic> config = const {}}) async {
+    _updateStatus('正在切换 MT 引擎...');
+    final ok = await _engineManager.switchMTEngine(
+      engineId: engineId,
+      config: {
+        'sourceLang': _mtSourceLang,
+        'targetLang': _mtTargetLang,
+        ...config,
+      },
+    );
+    if (ok) _updateStatus('MT 引擎已切换: $engineId');
+    return ok;
+  }
+  
+  void _updateStatus(String message) {
+    _statusMessage = message;
+    notifyListeners();
+  }
+  
+  void _clearError() {
+    _lastError = null;
+  }
+  
+  /// 清空字幕缓冲区
+  void clearSubtitles() {
+    _subtitleBuffer.clear();
+    notifyListeners();
+  }
+  
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _engineManager.removeListener(_onEngineChanged as void Function(EngineTypeEnum, String?));
+    stopService();
+    _engineManager.disposeAll();
+    super.dispose();
+  }
+}
+
+/// 字幕条目数据类
+class SubtitleEntry {
+  final String sourceText;
+  final String translatedText;
+  final DateTime timestamp;
+  final bool isFinal;
+  final String sourceLang;
+  final String targetLang;
+  
+  const SubtitleEntry({
+    required this.sourceText,
+    required this.translatedText,
+    required this.timestamp,
+    required this.isFinal,
+    required this.sourceLang,
+    required this.targetLang,
+  });
+  
+  @override
+  String toString() => 
+      'SubtitleEntry(${sourceLang}->${targetLang}: "$sourceText" -> "$translatedText", final: $isFinal)';
+}

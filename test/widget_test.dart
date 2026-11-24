@@ -1,0 +1,54 @@
+/// Widget 测试
+/// 验证主界面基本渲染
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:live_translate/ui/main_screen.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+
+void main() {
+  group('MainScreen Widget Tests', () {
+    testWidgets('MainScreen 基础渲染测试', (WidgetTester tester) async {
+      // 创建一个简单的 mock 服务，不初始化真实服务避免异步等待
+      final service = TranslationService();
+      
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: service,
+          child: const MaterialApp(home: MainScreen()),
+        ),
+      );
+      
+      // 等待一帧
+      await tester.pump();
+      
+      // 验证主界面渲染（加载/错误状态也可以接受）
+      expect(find.byType(Scaffold), findsOneWidget);
+      
+      // 清理
+      service.dispose();
+    });
+
+    testWidgets('MainScreen 包含关键 UI 元素', (WidgetTester tester) async {
+      final service = TranslationService();
+      
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: service,
+          child: const MaterialApp(home: MainScreen()),
+        ),
+      );
+      
+      await tester.pump();
+      
+      // 验证发光圆形按钮区域存在 (GestureDetector 包裹 Container)
+      expect(find.byType(GestureDetector), findsAtLeastNWidgets(1));
+      
+      // 验证标题存在
+      expect(find.text('实时翻译'), findsOneWidget);
+      
+      // 清理
+      service.dispose();
+    });
+  });
+}

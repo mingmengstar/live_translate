@@ -1,0 +1,65 @@
+/// Widget 测试
+/// 验证主界面基本渲染
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:live_translate/ui/main_screen.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+
+void main() {
+  testWidgets('MainScreen 渲染测试', (WidgetTester tester) async {
+    // 创建 Mock 服务
+    final service = TranslationService();
+    await service.initialize();
+    
+    // 构建测试应用
+    await tester.pumpWidget(
+      ChangeNotifierProvider.value(
+        value: service,
+        child: MaterialApp(home: const MainScreen()),
+      ),
+    );
+    
+    // 等待动画
+    await tester.pumpAndSettle();
+    
+    // 验证关键 UI 元素存在
+    expect(find.text('实时翻译'), findsOneWidget);
+    expect(find.byIcon(Icons.translate_rounded), findsOneWidget);
+    expect(find.text('点击开始实时翻译'), findsOneWidget);
+    expect(find.byIcon(Icons.play_arrow_rounded), findsOneWidget);
+    
+    // 验证卡片标题
+    expect(find.text('服务状态'), findsOneWidget);
+    expect(find.text('语言设置'), findsOneWidget);
+    expect(find.text('引擎选择'), findsOneWidget);
+    expect(find.text('字幕历史'), findsOneWidget);
+    
+    service.dispose();
+  });
+  
+  testWidgets('MainScreen 点击播放按钮启动服务', (WidgetTester tester) async {
+    final service = TranslationService();
+    await service.initialize();
+    
+    await tester.pumpWidget(
+      ChangeNotifierProvider.value(
+        value: service,
+        child: MaterialApp(home: const MainScreen()),
+      ),
+    );
+    
+    await tester.pumpAndSettle();
+    
+    // 点击播放按钮
+    await tester.tap(find.byIcon(Icons.play_arrow_rounded));
+    await tester.pumpAndSettle();
+    
+    // 验证服务启动
+    expect(service.isServiceRunning, true);
+    expect(find.text('正在监听系统音频...'), findsOneWidget);
+    expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+    
+    service.dispose();
+  });
+}

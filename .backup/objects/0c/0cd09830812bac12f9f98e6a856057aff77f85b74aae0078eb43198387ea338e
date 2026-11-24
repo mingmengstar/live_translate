@@ -1,0 +1,147 @@
+/// 快捷设置磁贴实现
+/// 使用 quick_settings_with_flutter_plugins 绑定系统快捷设置面板
+/// 控制翻译服务的全局开关
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
+// ignore: unused_import
+import 'package:system_audio_recorder/system_audio_recorder.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+
+/// 磁贴 ID 常量
+const String _kTileId = 'live_translate_tile';
+
+/// 磁贴点击回调（顶层函数，避免 release 模式被 tree-shake）
+@pragma('vm:entry-point')
+Tile? onTileClicked(Tile tile) {
+  // 这里的逻辑通过 MethodChannel 与主应用通信
+  // 实际的服务切换在主应用中处理
+  final oldStatus = tile.tileStatus;
+  if (oldStatus == TileStatus.active) {
+    tile.label = '实时翻译';
+    tile.tileStatus = TileStatus.inactive;
+    tile.subtitle = '点击启动';
+    // tile.drawableName = 'ic_tile_icon';
+  } else {
+    tile.label = '实时翻译';
+    tile.tileStatus = TileStatus.active;
+    tile.subtitle = '运行中...';
+    // tile.drawableName = 'ic_tile_active';
+  }
+  return tile;
+}
+
+/// 磁贴添加回调（顶层函数）
+@pragma('vm:entry-point')
+Tile? onTileAdded(Tile tile) {
+  tile.label = '实时翻译';
+  tile.tileStatus = TileStatus.inactive;
+  tile.subtitle = '点击启动';
+  // tile.drawableName = 'ic_tile_icon';
+  return tile;
+}
+
+/// 磁贴移除回调（顶层函数）
+@pragma('vm:entry-point')
+void onTileRemoved() {
+  debugPrint('[QuickSettingsTile] Tile removed from quick settings');
+}
+
+/// 磁贴服务类，管理快捷设置磁贴的生命周期和状态同步
+class QuickSettingsTileService {
+  static final QuickSettingsTileService _instance = QuickSettingsTileService._internal();
+  factory QuickSettingsTileService() => _instance;
+  QuickSettingsTileService._internal();
+  
+  // 回调引用
+  TranslationService? _translationService;
+  VoidCallback? _onStateChanged;
+  
+  /// 初始化磁贴服务
+  Future<void> initialize({
+    required TranslationService translationService,
+    required VoidCallback onStateChanged,
+  }) async {
+    _translationService = translationService;
+    _onStateChanged = onStateChanged;
+    
+    // 监听服务状态变化
+    translationService.addListener(_onTranslationServiceChanged);
+    
+    // 设置 QuickSettings 回调（必须在 runApp 之前调用）
+    // 这里只是确保初始化，实际 setup 应在 main.dart 中调用
+    debugPrint('[QuickSettingsTile] Initialized');
+  }
+  
+  /// 翻译服务状态变化监听
+  void _onTranslationServiceChanged() {
+    if (_translationService == null) return;
+    _syncTileState();
+    _onStateChanged?.call();
+  }
+  
+  /// 同步磁贴状态到系统
+  Future<void> _syncTileState() async {
+    if (_translationService == null) return;
+    
+    final isRunning = _translationService!.isServiceRunning;
+    final tile = Tile(
+      label: '实时翻译',
+      tileStatus: isRunning ? TileStatus.active : TileStatus.inactive,
+      subtitle: isRunning ? '运行中...' : '点击启动',
+      // drawableName: isRunning ? 'ic_tile_active' : 'ic_tile_icon',
+    );
+    
+    try {
+      await QuickSettings.syncTile(tile);
+      debugPrint('[QuickSettingsTile] State synced: active=$isRunning');
+    } catch (e, stack) {
+      debugPrint('[QuickSettingsTile] Sync state failed: $e\n$stack');
+    }
+  }
+  
+  /// 检查悬浮窗权限
+  Future<bool> _checkOverlayPermission() async {
+    try {
+      // 通过 MethodChannel 调用原生检查
+      const channel = MethodChannel('live_translate/permissions');
+      final result = await channel.invokeMethod<bool>('checkOverlayPermission');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('[QuickSettingsTile] Permission check failed: $e');
+      return false;
+    }
+  }
+  
+  /// 显示权限引导通知（高优先级）
+  Future<void> _showPermissionNotification() async {
+    try {
+      const channel = MethodChannel('live_translate/permissions');
+      await channel.invokeMethod('showOverlayPermissionNotification');
+    } catch (e) {
+      debugPrint('[QuickSettingsTile] Show notification failed: $e');
+    }
+  }
+  
+  /// 手动刷新磁贴状态（应用启动时调用）
+  Future<void> refreshTileState() async {
+    await _syncTileState();
+  }
+  
+  /// 释放资源
+  Future<void> dispose() async {
+    _translationService?.removeListener(_onTranslationServiceChanged);
+    _translationService = null;
+    _onStateChanged = null;
+    debugPrint('[QuickSettingsTile] Disposed');
+  }
+}
+
+/// 磁贴状态变化通知混入（供主 UI 使用）
+mixin QuickSettingsTileNotifier on ChangeNotifier {
+  QuickSettingsTileService get tileService => QuickSettingsTileService();
+  
+  void notifyTileStateChanged() {
+    notifyListeners();
+  }
+}

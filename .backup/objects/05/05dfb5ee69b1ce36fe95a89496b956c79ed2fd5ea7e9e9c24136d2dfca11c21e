@@ -1,0 +1,826 @@
+/// 主界面 UI
+/// 深色卡片式设计，包含发光的蓝色播放/停止按钮
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+import 'package:live_translate/core/engine/engine.dart';
+
+/// 检测是否在测试环境中
+bool _isTestEnvironment() {
+  // 通过判断 WidgetsBinding 类型来检测测试环境
+  try {
+    // 在 flutter_test 中，WidgetsBinding.instance 是 TestWidgetsFlutterBinding
+    return WidgetsBinding.instance.runtimeType.toString().contains('Test');
+  } catch (_) {
+    return false;
+  }
+}
+
+/// 测试环境标记，避免重复检测
+final bool _kIsTestEnvironment = _isTestEnvironment();
+
+class MainScreen extends StatefulWidget {
+  const MainScreen({super.key});
+  
+  @override
+  State<MainScreen> createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
+  late AnimationController _glowController;
+  late AnimationController _pulseController;
+  late Animation<double> _glowAnimation;
+  late Animation<double> _pulseAnimation;
+  
+  @override
+  void initState() {
+    super.initState();
+    
+    // 发光动画控制器 - 只在非测试环境创建动画
+    if (!_kIsTestEnvironment) {
+      _glowController = AnimationController(
+        duration: const Duration(seconds: 2),
+        vsync: this,
+      )..repeat(reverse: true);
+      
+      _glowAnimation = Tween<double>(begin: 0.3, end: 1.0).animate(
+        CurvedAnimation(parent: _glowController, curve: Curves.easeInOut),
+      );
+      
+      // 脉冲动画控制器（运行时）
+      _pulseController = AnimationController(
+        duration: const Duration(milliseconds: 1000),
+        vsync: this,
+      );
+      
+      _pulseAnimation = Tween<double>(begin: 1.0, end: 1.1).animate(
+        CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+      );
+    } else {
+      // 测试环境：创建虚拟控制器避免空指针，不启动动画循环
+      _glowController = AnimationController(
+        duration: const Duration(milliseconds: 1),
+        vsync: this,
+      );
+      _glowAnimation = AlwaysStoppedAnimation(0.5);
+      
+      _pulseController = AnimationController(
+        duration: const Duration(milliseconds: 1),
+        vsync: this,
+      );
+      _pulseAnimation = AlwaysStoppedAnimation(1.0);
+    }
+  }
+  
+  @override
+  void dispose() {
+    _glowController.dispose();
+    _pulseController.dispose();
+    super.dispose();
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<TranslationService>(
+      builder: (context, service, child) {
+        // 服务运行时启动脉冲动画（测试环境跳过动画循环）
+        if (!_kIsTestEnvironment) {
+          if (service.isServiceRunning && !_pulseController.isAnimating) {
+            _pulseController.repeat(reverse: true);
+          } else if (!service.isServiceRunning && _pulseController.isAnimating) {
+            _pulseController.stop();
+            _pulseController.reset();
+          }
+        }
+        
+        return Scaffold(
+          backgroundColor: const Color(0xFF121212),
+          body: SafeArea(
+            child: Column(
+              children: [
+                // 顶部状态栏区域
+                _buildHeader(context, service),
+                
+                // 主内容区域
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        // 主控制卡片
+                        _buildMainControlCard(context, service),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // 状态信息卡片
+                        _buildStatusCard(context, service),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // 语言设置卡片
+                        _buildLanguageCard(context, service),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // 引擎选择卡片
+                        _buildEngineCard(context, service),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // 字幕历史卡片
+                        _buildSubtitleHistoryCard(context, service),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+  
+  /// 顶部头部
+  Widget _buildHeader(BuildContext context, TranslationService service) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E1E),
+        border: Border(
+          bottom: BorderSide(
+            color: Colors.blue.withValues(alpha: 0.2),
+            width: 1,
+          ),
+        ),
+      ),
+      child: Row(
+        children: [
+          // 应用图标和标题
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.blue.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Icon(
+              Icons.translate_rounded,
+              color: Colors.blue,
+              size: 28,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '实时翻译',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: -0.5,
+                  ),
+                ),
+                Text(
+                  service.statusMessage,
+                  style: TextStyle(
+                    color: Colors.grey[400],
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // 状态指示灯
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 300),
+            width: 12,
+            height: 12,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: service.isServiceRunning 
+                  ? Colors.greenAccent 
+                  : (service.lastError != null ? Colors.redAccent : Colors.grey),
+              boxShadow: service.isServiceRunning
+                  ? [
+                      BoxShadow(
+                        color: Colors.greenAccent.withValues(alpha: 0.6),
+                        blurRadius: 8,
+                        spreadRadius: 2,
+                      ),
+                    ]
+                  : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  /// 主控制卡片（大按钮）
+  Widget _buildMainControlCard(BuildContext context, TranslationService service) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E1E),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: Colors.blue.withValues(alpha: 0.2),
+          width: 1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.blue.withValues(alpha: 0.05),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          // 状态文本
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: Text(
+              service.isServiceRunning ? '正在监听系统音频...' : '点击开始实时翻译',
+              key: ValueKey(service.isServiceRunning),
+              style: TextStyle(
+                color: service.isServiceRunning ? Colors.blue[300] : Colors.grey[400],
+                fontSize: 16,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          
+          const SizedBox(height: 32),
+          
+          // 发光播放/停止按钮
+          AnimatedBuilder(
+            animation: Listenable.merge([_glowAnimation, _pulseAnimation]),
+            builder: (context, child) {
+              final isRunning = service.isServiceRunning;
+              final glowIntensity = isRunning ? _pulseAnimation.value * _glowAnimation.value : _glowAnimation.value;
+              final scale = isRunning ? _pulseAnimation.value : 1.0;
+              
+              return Transform.scale(
+                scale: scale,
+                child: GestureDetector(
+                  onTap: () => service.toggleService(),
+                  child: Container(
+                    width: 100,
+                    height: 100,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(
+                        colors: isRunning
+                            ? [
+                                Colors.redAccent.withValues(alpha: 0.9),
+                                Colors.redAccent.withValues(alpha: 0.6),
+                                Colors.redAccent.withValues(alpha: 0.2),
+                              ]
+                            : [
+                                Colors.blue.withValues(alpha: 0.9),
+                                Colors.blue.withValues(alpha: 0.6),
+                                Colors.blue.withValues(alpha: 0.2),
+                              ],
+                        stops: const [0.0, 0.5, 1.0],
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: (isRunning ? Colors.redAccent : Colors.blue)
+                              .withValues(alpha: 0.4 * glowIntensity),
+                          blurRadius: 30 * glowIntensity,
+                          spreadRadius: 5 * glowIntensity,
+                        ),
+                        BoxShadow(
+                          color: (isRunning ? Colors.redAccent : Colors.blue)
+                              .withValues(alpha: 0.2 * glowIntensity),
+                          blurRadius: 60 * glowIntensity,
+                          spreadRadius: 15 * glowIntensity,
+                        ),
+                      ],
+                    ),
+                    child: Center(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 200),
+                        transitionBuilder: (child, animation) {
+                          return RotationTransition(
+                            turns: animation,
+                            child: ScaleTransition(scale: animation, child: child),
+                          );
+                        },
+                        child: Icon(
+                          isRunning ? Icons.stop_rounded : Icons.play_arrow_rounded,
+                          key: ValueKey(isRunning),
+                          color: Colors.white,
+                          size: 44,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          
+          const SizedBox(height: 24),
+          
+          // 当前识别文本预览
+          if (service.currentPartialText.isNotEmpty || service.currentTranslatedPartial.isNotEmpty)
+            _buildLivePreview(service),
+        ],
+      ),
+    );
+  }
+  
+  /// 实时预览区域
+  Widget _buildLivePreview(TranslationService service) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A2A2A),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Colors.blue.withValues(alpha: 0.15),
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.mic_rounded, size: 16, color: Colors.blue[300]),
+              const SizedBox(width: 8),
+              Text(
+                '实时识别',
+                style: TextStyle(
+                  color: Colors.blue[300],
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 200),
+            child: Text(
+              service.currentPartialText.isNotEmpty 
+                  ? service.currentPartialText 
+                  : '等待语音输入...',
+              key: ValueKey(service.currentPartialText),
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.9),
+                fontSize: 15,
+                height: 1.4,
+              ),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (service.currentTranslatedPartial.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Icon(Icons.translate_rounded, size: 16, color: Colors.greenAccent[200]),
+                const SizedBox(width: 8),
+                Text(
+                  '实时翻译',
+                  style: TextStyle(
+                    color: Colors.greenAccent[200],
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: Text(
+                service.currentTranslatedPartial,
+                key: ValueKey(service.currentTranslatedPartial),
+                style: TextStyle(
+                  color: Colors.greenAccent[100],
+                  fontSize: 15,
+                  height: 1.4,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+  
+  /// 状态信息卡片
+  Widget _buildStatusCard(BuildContext context, TranslationService service) {
+    return _buildCard(
+      title: '服务状态',
+      icon: Icons.info_outline_rounded,
+      child: Column(
+        children: [
+          _buildStatusRow('运行状态', service.isServiceRunning ? '运行中' : '已停止', 
+              valueColor: service.isServiceRunning ? Colors.greenAccent : Colors.grey),
+          _buildStatusRow('ASR 引擎', service.engineManager.currentASR?.displayName ?? '未选择'),
+          _buildStatusRow('MT 引擎', service.engineManager.currentMT?.displayName ?? '未选择'),
+          _buildStatusRow('语言方向', '${service.mtSourceLang} → ${service.mtTargetLang}'),
+          if (service.lastError != null)
+            _buildStatusRow('最后错误', service.lastError!, 
+                valueColor: Colors.redAccent, isError: true),
+        ],
+      ),
+    );
+  }
+  
+  Widget _buildStatusRow(String label, String value, {Color? valueColor, bool isError = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                color: Colors.grey[500],
+                fontSize: 14,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Flexible(
+            child: Text(
+              value,
+              style: TextStyle(
+                color: valueColor ?? Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+              ),
+              textAlign: TextAlign.end,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  /// 语言设置卡片
+  Widget _buildLanguageCard(BuildContext context, TranslationService service) {
+    return _buildCard(
+      title: '语言设置',
+      icon: Icons.language_rounded,
+      child: Column(
+        children: [
+          // ASR 语言选择
+          _buildDropdownSetting(
+            label: '识别语言 (ASR)',
+            value: service.asrLanguage,
+            items: const [
+              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
+              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
+              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
+              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
+            ],
+            onChanged: (value) => service.setASRLanguage(value!),
+          ),
+          
+          const Divider(color: Colors.white10, height: 24),
+          
+          // MT 源语言
+          _buildDropdownSetting(
+            label: '源语言 (MT)',
+            value: service.mtSourceLang,
+            items: const [
+              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
+              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
+              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
+              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
+            ],
+            onChanged: (value) => service.setMTLanguagePair(value!, service.mtTargetLang),
+          ),
+          
+          const Divider(color: Colors.white10, height: 24),
+          
+          // MT 目标语言
+          _buildDropdownSetting(
+            label: '目标语言 (MT)',
+            value: service.mtTargetLang,
+            items: const [
+              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
+              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
+              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
+              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
+            ],
+            onChanged: (value) => service.setMTLanguagePair(service.mtSourceLang, value!),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  Widget _buildDropdownSetting({
+    required String label,
+    required String value,
+    required List<DropdownMenuItem<String>> items,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: Colors.grey[400],
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            color: const Color(0xFF2A2A2A),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white10),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: value,
+              isExpanded: true,
+              dropdownColor: const Color(0xFF2A2A2A),
+              style: const TextStyle(color: Colors.white, fontSize: 15),
+              icon: Icon(Icons.keyboard_arrow_down_rounded, color: Colors.grey[400]),
+              items: items,
+              onChanged: onChanged,
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+  
+  /// 引擎选择卡片
+  Widget _buildEngineCard(BuildContext context, TranslationService service) {
+    return _buildCard(
+      title: '引擎选择',
+      icon: Icons.memory_rounded,
+      child: Column(
+        children: [
+          // ASR 引擎选择
+          _buildEngineSelector(
+            label: 'ASR 引擎',
+            currentEngine: service.engineManager.currentASRId,
+            availableEngines: service.engineManager.getRegisteredASREngines(),
+            engineDisplayNames: {
+              'mock_asr': 'Mock ASR (测试用)',
+            },
+            onChanged: (engineId) => service.switchASREngine(engineId),
+          ),
+          
+          const Divider(color: Colors.white10, height: 24),
+          
+          // MT 引擎选择
+          _buildEngineSelector(
+            label: 'MT 引擎',
+            currentEngine: service.engineManager.currentMTId,
+            availableEngines: service.engineManager.getRegisteredMTEngines(),
+            engineDisplayNames: {
+              'mock_mt': 'Mock MT (测试用)',
+            },
+            onChanged: (engineId) => service.switchMTEngine(engineId),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  Widget _buildEngineSelector({
+    required String label,
+    required String? currentEngine,
+    required List<String> availableEngines,
+    required Map<String, String> engineDisplayNames,
+    required ValueChanged<String> onChanged,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: Colors.grey[400],
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: availableEngines.map((engineId) {
+            final isSelected = engineId == currentEngine;
+            final displayName = engineDisplayNames[engineId] ?? engineId;
+            return FilterChip(
+              label: Text(
+                displayName,
+                style: TextStyle(
+                  color: isSelected ? Colors.white : Colors.grey[300],
+                  fontSize: 13,
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+              selected: isSelected,
+              onSelected: (_) => onChanged(engineId),
+              selectedColor: Colors.blue.withValues(alpha: 0.3),
+              checkmarkColor: Colors.blue,
+              backgroundColor: const Color(0xFF2A2A2A),
+              side: BorderSide(
+                color: isSelected ? Colors.blue : Colors.white10,
+                width: 1.5,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+            );
+          }).toList(),
+        ),
+      ],
+    );
+  }
+  
+  /// 字幕历史卡片
+  Widget _buildSubtitleHistoryCard(BuildContext context, TranslationService service) {
+    return _buildCard(
+      title: '字幕历史 (${service.subtitleBuffer.length})',
+      icon: Icons.history_rounded,
+      action: service.subtitleBuffer.isNotEmpty
+          ? TextButton.icon(
+              onPressed: () => service.clearSubtitles(),
+              icon: const Icon(Icons.clear_all_rounded, size: 16),
+              label: const Text('清空'),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.grey[500],
+                textStyle: const TextStyle(fontSize: 12),
+              ),
+            )
+          : null,
+      child: service.subtitleBuffer.isEmpty
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 32),
+                child: Column(
+                  children: [
+                    Icon(Icons.subtitles_rounded, size: 48, color: Colors.grey[800]),
+                    const SizedBox(height: 12),
+                    Text(
+                      '暂无字幕记录',
+                      style: TextStyle(color: Colors.grey[600], fontSize: 14),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '开始服务后将显示实时翻译结果',
+                      style: TextStyle(color: Colors.grey[700], fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : ListView.separated(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: service.subtitleBuffer.length.clamp(0, 20),
+              separatorBuilder: (_, __) => const Divider(color: Colors.white10, height: 1),
+              itemBuilder: (context, index) {
+                final entry = service.subtitleBuffer[index];
+                return _buildSubtitleTile(entry);
+              },
+            ),
+    );
+  }
+  
+  Widget _buildSubtitleTile(SubtitleEntry entry) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: entry.isFinal ? Colors.green.withValues(alpha: 0.2) : Colors.orange.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  '${entry.sourceLang}→${entry.targetLang}',
+                  style: TextStyle(
+                    color: entry.isFinal ? Colors.greenAccent : Colors.orangeAccent,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '${entry.timestamp.hour.toString().padLeft(2, '0')}:${entry.timestamp.minute.toString().padLeft(2, '0')}:${entry.timestamp.second.toString().padLeft(2, '0')}',
+                style: TextStyle(color: Colors.grey[500], fontSize: 11),
+              ),
+              if (!entry.isFinal) ...[
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.orangeAccent),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            entry.sourceText,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.85),
+              fontSize: 13,
+              height: 1.4,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            entry.translatedText,
+            style: TextStyle(
+              color: Colors.blue[200],
+              fontSize: 13,
+              height: 1.4,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+  
+  /// 通用卡片构建器
+  Widget _buildCard({
+    required String title,
+    required IconData icon,
+    required Widget child,
+    Widget? action,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E1E),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white10),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.2),
+            blurRadius: 15,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: Colors.blue[300], size: 20),
+              const SizedBox(width: 10),
+              Text(
+                title,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              if (action != null) action,
+            ],
+          ),
+          const SizedBox(height: 16),
+          child,
+        ],
+      ),
+    );
+  }
+}

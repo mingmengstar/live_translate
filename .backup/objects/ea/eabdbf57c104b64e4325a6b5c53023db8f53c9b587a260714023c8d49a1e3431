@@ -1,0 +1,78 @@
+/// Widget 测试
+/// 验证主界面基本渲染
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:live_translate/ui/main_screen.dart';
+import 'package:live_translate/core/service/translation_service.dart';
+
+void main() {
+  group('MainScreen Widget Tests', () {
+    testWidgets('MainScreen 渲染测试', (WidgetTester tester) async {
+      // 创建一个 mock 的 TranslationService
+      final service = TranslationService();
+      await service.initialize();
+      
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: service,
+          child: const MaterialApp(home: MainScreen()),
+        ),
+      );
+      
+      // 验证主界面渲染
+      expect(find.text('实时翻译'), findsOneWidget);
+      expect(find.byIcon(Icons.translate_rounded), findsOneWidget);
+      expect(find.text('点击开始实时翻译'), findsOneWidget);
+      
+      // 清理
+      service.dispose();
+    });
+
+    testWidgets('MainScreen 状态显示测试', (WidgetTester tester) async {
+      final service = TranslationService();
+      await service.initialize();
+      
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: service,
+          child: const MaterialApp(home: MainScreen()),
+        ),
+      );
+      
+      // 验证状态卡片存在
+      expect(find.text('服务状态'), findsOneWidget);
+      expect(find.text('语言设置'), findsOneWidget);
+      expect(find.text('引擎选择'), findsOneWidget);
+      expect(find.text('字幕历史'), findsOneWidget);
+      
+      // 清理
+      service.dispose();
+    });
+
+    testWidgets('MainScreen 语言下拉框测试', (WidgetTester tester) async {
+      final service = TranslationService();
+      await service.initialize();
+      
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: service,
+          child: const MaterialApp(home: MainScreen()),
+        ),
+      );
+      
+      // 点击 ASR 语言下拉框
+      await tester.tap(find.text('识别语言 (ASR)').first);
+      await tester.pumpAndSettle();
+      
+      // 验证下拉菜单项存在
+      expect(find.text('英语 (English)'), findsWidgets);
+      expect(find.text('日语 (日本語)'), findsWidgets);
+      expect(find.text('中文 (中文)'), findsWidgets);
+      expect(find.text('韩语 (한국어)'), findsWidgets);
+      
+      // 清理
+      service.dispose();
+    });
+  });
+}
