@@ -1,5 +1,7 @@
 /// MT 引擎抽象接口
 /// 负责源语言到目标语言的翻译
+library live_translate.core.engine.mt_engine;
+
 abstract interface class MTEngine {
   /// 引擎唯一标识符
   String get engineId;

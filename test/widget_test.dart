@@ -1,5 +1,7 @@
 /// Widget 测试
 /// 验证主界面基本渲染
+library live_translate.test.widget_test;
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';

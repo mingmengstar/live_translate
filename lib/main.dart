@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
 import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';
@@ -121,12 +120,11 @@ class _LiveTranslateAppState extends State<LiveTranslateApp> {
         primary: Color(0xFF00B0FF),
         secondary: Color(0xFF00E5A0),
         surface: Color(0xFF1E1E1E),
-        background: Color(0xFF121212),
+        surfaceContainerHighest: Color(0xFF121212),
         error: Colors.redAccent,
         onPrimary: Colors.white,
         onSecondary: Colors.black,
         onSurface: Colors.white,
-        onBackground: Colors.white,
         onError: Colors.white,
       ),
       scaffoldBackgroundColor: const Color(0xFF121212),

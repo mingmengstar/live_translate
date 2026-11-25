@@ -1,6 +1,8 @@
 /// 音频捕获服务
 /// 集成 system_audio_recorder 进行系统内录，实现 VAD 语音活动检测
 /// 将 16kHz 单声道 PCM 音频切片推送给 ASR 引擎
+library live_translate.core.audio.audio_capture_service;
+
 import 'dart:async';
 import 'dart:developer';
 import 'dart:math' as math;

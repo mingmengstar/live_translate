@@ -1,5 +1,7 @@
 /// Mock MT 引擎实现
 /// 用于开发调试，给文本加前缀返回，模拟流式翻译输出
+library live_translate.core.engine.mock_mt;
+
 import 'dart:developer';
 import 'mt_engine.dart';
 

@@ -1,5 +1,6 @@
 /// Engine 核心库导出文件
 /// 统一导出所有引擎相关的接口、实现和管理器
+library live_translate.core.engine.engine;
 
 // 接口定义
 export 'asr_engine.dart';

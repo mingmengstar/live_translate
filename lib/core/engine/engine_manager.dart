@@ -1,6 +1,8 @@
 /// 引擎管理器
 /// 统一管理 ASR 和 MT 引擎的实例化、状态切换与销毁
 /// 实现单例模式
+library live_translate.core.engine.engine_manager;
+
 import 'dart:developer';
 import 'asr_engine.dart';
 import 'mt_engine.dart';

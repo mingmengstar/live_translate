@@ -1,5 +1,7 @@
 /// 主界面 UI
 /// 深色卡片式设计，包含发光的蓝色播放/停止按钮
+library live_translate.ui.main_screen;
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:live_translate/core/service/translation_service.dart';

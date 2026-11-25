@@ -1,5 +1,7 @@
 /// ASR 引擎抽象接口
 /// 负责将音频流转换为文本流
+library live_translate.core.engine.asr_engine;
+
 abstract interface class ASREngine {
   /// 引擎唯一标识符
   String get engineId;

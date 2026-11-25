@@ -1,5 +1,7 @@
 /// Mock ASR 引擎实现
 /// 用于开发调试，定时产生假数据，模拟流式输出
+library live_translate.core.engine.mock_asr;
+
 import 'dart:async';
 import 'dart:developer';
 import 'asr_engine.dart';

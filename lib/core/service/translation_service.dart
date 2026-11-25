@@ -1,6 +1,8 @@
 /// 翻译服务
 /// 协调 ASR 和 MT 引擎，处理完整的音频 -> 文本 -> 翻译 流程
 /// 使用 Provider 进行状态管理
+library live_translate.core.service.translation_service;
+
 import 'dart:async';
 import 'dart:developer';
 import 'package:flutter/foundation.dart';

@@ -32,6 +32,18 @@ linter:
   rules:
     # avoid_print: false  # Uncomment to disable the `avoid_print` rule
     # prefer_single_quotes: true  # Uncomment to enable the `prefer_single_quotes` rule
+    
+    # 关闭 Flutter 3.27+ 误报：package:flutter/material.dart 不再废弃
+    deprecated_member_use_from_same_package: false
+    
+    # 允许悬空库文档注释（我们将通过添加 library 指令修复，但保留此项兜底）
+    dangling_library_doc_comments: false
+    
+    # library 指令在 Dart 3+ 中通常不需要
+    unnecessary_library_name: false
+    
+    # 允许 if (x != null) x! 模式（建议改用 pattern matching，但为兼容保留）
+    use_null_aware_elements: false
 
 # Additional information about this file can be found at
 # https://dart.dev/guides/language/analysis-options

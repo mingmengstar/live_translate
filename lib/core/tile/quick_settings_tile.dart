@@ -1,6 +1,8 @@
 /// 快捷设置磁贴实现
 /// 使用 quick_settings_with_flutter_plugins 绑定系统快捷设置面板
 /// 控制翻译服务的全局开关
+library live_translate.core.tile.quick_settings_tile;
+
 import 'package:flutter/foundation.dart';
 import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';

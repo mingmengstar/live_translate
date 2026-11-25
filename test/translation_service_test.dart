@@ -1,8 +1,9 @@
 /// 翻译服务单元测试
 /// 验证 Mock 引擎链路完整性
+library live_translate.test.translation_service_test;
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:live_translate/core/engine/engine.dart';
-import 'package:live_translate/core/service/translation_service.dart';
 
 void main() {
   group('TranslationService', () {

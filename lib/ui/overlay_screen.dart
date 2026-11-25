@@ -1,8 +1,9 @@
 /// 悬浮窗覆盖层 UI
 /// 独立的 Flutter 引擎入口点，通过 FlutterScreenOverlay.overlayListener 接收主引擎数据
 /// 使用 @pragma('vm:entry-point') 标记
+library live_translate.ui.overlay_screen;
+
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart' as overlay;
