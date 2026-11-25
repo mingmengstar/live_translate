@@ -47,13 +47,18 @@ jobs:
           java-version: '17'
           cache: 'gradle'
       
-      # 5. 设置 Flutter
-      - name: Setup Flutter
-        uses: flutter-actions/setup-flutter@v4
-        with:
-          channel: 'stable'
-          version: '3.44.0'
-          cache: true
+      # 5. 手动安装 Flutter（完全跳过 flutter-action 及其缓存问题）
+      - name: Setup Flutter manually
+        run: |
+          # 下载并安装 Flutter SDK
+          cd $HOME
+          git clone -b stable --depth 1 https://github.com/flutter/flutter.git
+          export PATH="$PATH:$HOME/flutter/bin"
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          # 禁用桌面端
+          flutter config --no-enable-linux-desktop --no-enable-macos-desktop --no-enable-windows-desktop
+          # 验证版本
+          flutter --version
       
       # 6. 接受 Android licenses
       - name: Accept Android licenses
@@ -102,36 +107,15 @@ jobs:
           echo "=== app build.gradle.kts ==="
           cat android/app/build.gradle.kts | head -50
       
-      # 13. 准备构建环境
-      - name: Prepare build environment
+      # 13. 构建 Release APK
+      - name: Build APK
         run: |
-          # 确保 flutter 在 PATH 中
-          if [ -d "$HOME/flutter/bin" ]; then
-            export PATH="$PATH:$HOME/flutter/bin"
-            echo "Added $HOME/flutter/bin to PATH"
-          elif [ -d "/opt/hostedtoolcache/flutter/3.44.0/bin" ]; then
-            export PATH="$PATH:/opt/hostedtoolcache/flutter/3.44.0/bin"
-            echo "Added /opt/hostedtoolcache/flutter/3.44.0/bin to PATH"
-          elif command -v flutter >/dev/null 2>&1; then
-            echo "flutter already in PATH: $(which flutter)"
-          else
-            echo "ERROR: flutter not found in any known location"
-            find / -name "flutter" -type f 2>/dev/null | head -5
-          fi
-          
-          # 验证 flutter 可用
-          flutter --version
-          
           # 创建构建日志文件
           touch build.log
           echo "=== Build log created at $(date) ===" > build.log
           echo "Working directory: $(pwd)" >> build.log
           echo "PATH: $PATH" >> build.log
-      
-      # 14. 构建 Release APK
-      - name: Build APK
-        working-directory: .
-        run: |
+          
           echo "=== Starting Flutter build at $(date) ===" >> build.log
           
           # 运行构建并同时输出到控制台和日志文件
@@ -160,16 +144,7 @@ jobs:
             ls -la >> build.log
           fi
       
-      # 15. 上传构建日志（始终上传用于调试）
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          retention-days: 7
-      
-      # 15. 查找 APK 文件
+# 16. 查找 APK 文件
       - name: Find APK files
         run: |
           echo "=== Full build/app/outputs tree ==="
