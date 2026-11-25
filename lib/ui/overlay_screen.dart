@@ -2,11 +2,10 @@
 /// 独立的 Flutter 引擎入口点，通过 FlutterScreenOverlay.overlayListener 接收主引擎数据
 /// 使用 @pragma('vm:entry-point') 标记
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart' as overlay;
-// ignore: unused_import
-import 'package:system_audio_recorder/system_audio_recorder.dart';
 
 /// 悬浮窗入口点（必须标记为 vm:entry-point）
 @pragma('vm:entry-point')

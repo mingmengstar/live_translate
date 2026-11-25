@@ -19,23 +19,35 @@ jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     
     steps:
       # 1. 检出代码
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       
-      # 2. 设置 Java 17 (关键：GitHub Actions 默认可能是 Java 11/21)
+      # 2. 立即删除桌面端目录（checkout 后立即执行，防止后续步骤触发符号链接权限问题）
+      - name: Remove desktop directories immediately
+        run: |
+          rm -rf linux macos windows 2>/dev/null || true
+      
+      # 3. 删除 sherpa-onnx 模型目录（防止被打包进 APK，导致体积巨大）
+      - name: Remove sherpa-onnx model directories
+        run: |
+          rm -rf sherpa-onnx-streaming-zipformer-* 2>/dev/null || true
+          rm -rf sherpa-onnx-streaming-zipformer-*.tar.bz2 2>/dev/null || true
+      
+      # 4. 设置 Java 17 (关键：GitHub Actions 默认可能是 Java 11/21)
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
       
-      # 3. 设置 Flutter
+      # 5. 设置 Flutter
       - name: Setup Flutter
         uses: flutter-actions/setup-flutter@v4
         with:
@@ -43,36 +55,97 @@ jobs:
           version: '3.44.0'
           cache: true
       
-      # 4. 获取依赖
+      # 6. 接受 Android licenses
+      - name: Accept Android licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+      
+      # 7. 清理构建缓存
+      - name: Flutter clean
+        run: flutter clean
+      
+      # 8. 配置 Gradle 内存限制防 OOM
+      - name: Configure Gradle memory
+        run: |
+          cat >> android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -Dorg.gradle.workers.max=2 -Dorg.gradle.daemon=false -Dorg.gradle.parallel=false
+          android.enableAapt2Daemon=false
+          EOF
+      
+      # 9. 获取依赖
       - name: Get dependencies
         run: flutter pub get
         working-directory: .
       
-      # 5. 代码分析
+      # 10. 代码分析
       - name: Analyze code
         run: flutter analyze
         working-directory: .
       
-      # 6. 运行测试
+      # 11. 运行测试
       - name: Run tests
         run: flutter test
         working-directory: .
       
-      # 7. 构建 Release APK
-      - name: Build APK
-        run: flutter build apk --release --split-per-abi
-        working-directory: .
+      # 12. 诊断环境信息（便于排查）
+      - name: Diagnose environment
+        run: |
+          echo "=== Flutter doctor ==="
+          flutter doctor -v
+          echo "=== Android SDK/NDK ==="
+          ls -la $ANDROID_HOME/ndk/ 2>/dev/null || echo "NDK not found in $ANDROID_HOME/ndk"
+          ls -la $ANDROID_HOME/build-tools/ 2>/dev/null || echo "Build tools not found"
+          echo "=== Gradle wrapper ==="
+          cat android/gradle/wrapper/gradle-wrapper.properties
+          echo "=== Project gradle.properties ==="
+          cat android/gradle.properties
+          echo "=== app build.gradle.kts ==="
+          cat android/app/build.gradle.kts | head -50
       
-      # 8. 上传构建产物
+      # 13. 构建 Release APK
+      - name: Build APK
+        run: |
+          set -x
+          set -o pipefail
+          flutter build apk --release --split-per-abi --verbose 2>&1 | tee build.log
+        env:
+          FLUTTER_VERBOSE: 1
+      
+      # 14. 上传构建日志（始终上传用于调试）
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+      
+      # 15. 查找 APK 文件
+      - name: Find APK files
+        run: |
+          echo "=== Full build/app/outputs tree ==="
+          find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -30 || echo "No APKs found in build/app/outputs"
+          # 保存找到的第一个 APK 路径供后续步骤使用
+          APK_PATH=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -1)
+          if [ -n "$APK_PATH" ]; then
+            echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+            echo "First APK found at: $APK_PATH"
+          else
+            echo "WARNING: No APK found anywhere in build/app/outputs"
+            echo "APK_PATH=build/app/outputs/flutter-apk/*.apk" >> $GITHUB_ENV
+          fi
+      
+      # 16. 上传构建产物
       - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: release-apks
           path: |
             build/app/outputs/flutter-apk/*.apk
+            build/app/outputs/apk/**/*.apk
           retention-days: 30
       
-      # 9. 准备发布信息
+      # 17. 准备发布信息
       - name: Prepare release notes
         id: release_notes
         run: |
@@ -84,7 +157,7 @@ jobs:
           echo "name=Release $TAG" >> $GITHUB_OUTPUT
           echo "body=$(git log --oneline -10)" >> $GITHUB_OUTPUT
       
-      # 10. 创建 GitHub Release 并上传 APK
+      # 18. 创建 GitHub Release 并上传 APK
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
