@@ -119,8 +119,7 @@ jobs:
           echo "=== Starting Flutter build at $(date) ===" >> build.log
           
           # 运行构建并同时输出到控制台和日志文件
-          # 使用 --android-skip-build-dependency-validation 跳过 AGP/Gradle 版本校验（兼容 AGP 9.0.0 + Gradle 9.3.1）
-          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation --verbose 2>&1 | tee -a build.log
+          flutter build apk --release --split-per-abi --verbose 2>&1 | tee -a build.log
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
           echo "=== Build finished with exit code: $BUILD_EXIT_CODE at $(date) ===" >> build.log
           # 保存退出码到环境变量供后续步骤使用
