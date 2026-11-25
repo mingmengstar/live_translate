@@ -3,6 +3,7 @@ package com.example.live_translate
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.embedding.engine.dart.DartExecutor
@@ -23,9 +24,23 @@ class OverlayFlutterEngine : Service() {
     private fun initFlutterEngine() {
         // 创建或获取缓存的 Flutter Engine
         flutterEngine = FlutterEngineCache.getInstance().get("overlay_engine") ?: FlutterEngine(this).apply {
-            // 启动引擎，指定入口点为 overlayMain (Flutter 3.44+ API)
-            val options = DartExecutor.DartEntrypoint.createDefault()
-            runAppWithEntrypoint(options, "overlayMain", null)
+            // 启动引擎，指定 Dart 入口点为 overlayMain（lib/ui/overlay_screen.dart）
+            //
+            // 关键点：
+            // 1. FlutterEngine 没有 runAppWithEntrypoint 方法，必须走 executeDartEntrypoint。
+            // 2. 用 FlutterInjector 拿到正确的 assets bundle 路径，不能写死 "/"，否则运行时
+            //    资源加载失败。
+            // 3. 本 Service 跑在独立进程 (:overlay) 中，FlutterLoader 可能尚未初始化，
+            //    因此这里显式调用 startInitialization / ensureInitializationComplete。
+            val loader = FlutterInjector.instance().flutterLoader()
+            loader.startInitialization(applicationContext)
+            loader.ensureInitializationComplete(applicationContext, null)
+
+            val entrypoint = DartExecutor.DartEntrypoint(
+                loader.findAppBundlePath(),
+                "overlayMain"
+            )
+            dartExecutor.executeDartEntrypoint(entrypoint)
         }
         
         // 缓存引擎以便复用
