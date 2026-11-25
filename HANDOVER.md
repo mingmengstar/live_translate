@@ -216,3 +216,70 @@ Flutter 3.50.1 已对旧版本发出即将停止支持的警告：
 | P1 | 迁到 Built-in Kotlin | AGP 10 / 未来 Flutter 将强制要求，需 `android.builtInKotlin=true` + 移除 app 与插件的 KGP 应用 |
 | P1 | 三个插件未支持 Built-in Kotlin | `flutter_foreground_task`、`quick_settings_with_flutter_plugins`、`system_audio_recorder` 需升级或等上游适配 |
 | P2 | 无 Release 签名 | 仍用 debug 签名，正式发布前必须配置 keystore |
+
+---
+
+## 10. 交接快照（2026-11-26，上下文将超限时暂停）
+
+### 10.1 当前 Git 状态
+
+| 项 | 值 |
+|----|-----|
+| 分支 | `master` |
+| HEAD | `f6b7fdf` fix(android): override compileSdk=36 for Flutter plugin modules |
+| 远程 | `https://github.com/mingmengstar/live_translate.git`（已推送，master 与 tag 同步） |
+| 最近 tag | `v0.1.0-ci-test-4` → 指向 `f6b7fdf`，**已触发 Actions Run #22** |
+
+### 10.2 已提交的 4 轮 CI 修复（按时间顺序）
+
+| 提交 | 解决的问题 | 结果 |
+|------|-----------|------|
+| `1ded251` | ① `android-arm/flutter.jar` 缺失（新增 Precache 步骤）② `$GITHUB_OUTPUT` 多行值非法（改 heredoc）③ 移除 `continue-on-error` ④ 版本升级 Gradle 9.5.0 / AGP 9.3.1 / Kotlin 2.4.20 | Run #20：①②③ 全部生效，暴露出下一层错误 |
+| `bcc56b7` | `OverlayFlutterEngine.kt:28` 调用不存在的 `FlutterEngine.runAppWithEntrypoint()`，改为 `DartExecutor.DartEntrypoint` + `executeDartEntrypoint()`，并显式初始化 `FlutterLoader`（Service 在 `:overlay` 独立进程） | Run #21：Kotlin 错误清零，`e:` 数量 0，编译阶段通过 |
+| `f6b7fdf` | `quick_settings_with_flutter_plugins 1.3.1` 自身 compileSdk=33 < 依赖要求的 34，AGP 9.3 的 `checkReleaseAarMetadata` 报 15 项错误。方案 A：在 `android/build.gradle.kts` 的 `subprojects` 用反射（`afterEvaluate` 内）把非 app 模块 `compileSdk` 抬到 36；并新增 `Diagnose plugin compileSdk` 诊断步骤 | **Run #22 结果未验证（暂停点）** |
+
+### 10.3 下一步（接手后第一件事）
+
+**查看 Run #22（tag `v0.1.0-ci-test-4`）结果**：
+
+```
+https://github.com/mingmengstar/live_translate/actions/runs?per_page=1
+```
+
+判断依据：
+- 若 `Diagnose plugin compileSdk` + `Build APK` 均 success → 进入 `Find APK files` / `Upload APK artifacts`，下载 4 架构 APK 做真机验证（交接文档第 8 节步骤 3）
+- 若仍报 `checkReleaseAarMetadata` → 说明 `afterEvaluate` 反射覆盖未生效，日志中会有 `[compileSdk-override] xxx: 33 -> 36` 或 `setCompileSdk(int) not found` 字样，据此判断。备选方案见下
+
+### 10.4 compileSdk 覆盖失败时的备选方案
+
+1. **改用 AGP 官方 API**（比反射稳）：`extensions.configure<com.android.build.gradle.LibraryExtension> { compileSdk = 36 }`
+2. **改用 `dependency_overrides` 本地 fork** 该插件，直接把 plugin 的 compileSdk 改成 36
+3. **回退 AGP 到 9.1.1**（绕过 checkReleaseAarMetadata，但会回到 Flutter 已警告「即将不支持」的状态）
+
+### 10.5 已知遗留问题（未处理）
+
+| 优先级 | 问题 |
+|--------|------|
+| P0 | WebRTC VAD 替换简单能量 VAD（`audio_capture_service.dart` 误触发严重） |
+| P1 | Sherpa-ONNX ASR / llama.cpp MT 真实模型接入（当前仍是 Mock） |
+| P1 | 迁到 Built-in Kotlin（`android.builtInKotlin=true`），三个插件未适配 |
+| P2 | 悬浮窗双向通道（当前仅单向 `shareData()`） |
+| P2 | 设置持久化（SharedPreferences） |
+| P2 | Release 签名 keystore 未配置 |
+
+### 10.6 ⚠️ 安全提醒（务必处理）
+
+本次会话中 GITHUB PAT 曾在聊天明文出现（用户表示不在意），但**建议在项目正式发布前更换**，并改用 GitHub Actions Secrets 注入，避免出现在命令/日志中。所有历史提交命令已做 `sed` 脱敏处理，仓库内无明文密钥。
+
+### 10.7 本次新增/修改的文件清单
+
+```
+.github/workflows/build_and_release.yml   # Precache 步骤、heredoc 修复、去掉 continue-on-error、
+                                          # Find APK 硬校验、Diagnose plugin compileSdk
+android/build.gradle.kts                  # subprojects 内 compileSdk=36 覆盖
+android/gradle/wrapper/gradle-wrapper.properties  # 9.3.1 -> 9.5.0
+android/settings.gradle.kts               # AGP 9.1.1->9.3.1, Kotlin 2.2.20->2.4.20
+android/app/src/main/kotlin/.../OverlayFlutterEngine.kt  # runAppWithEntrypoint 修复
+.gitignore                                # 追加 .backup/ 与 android/.gradle/
+HANDOVER.md                               # 新增第 9、10 节
+```
