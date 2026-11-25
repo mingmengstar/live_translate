@@ -106,12 +106,16 @@ jobs:
       - name: Build APK
         working-directory: .
         run: |
-          set -x
           # 确保日志文件在开始时就存在
           touch build.log
           echo "=== Starting Flutter build at $(date) ===" >> build.log
           echo "Working directory: $(pwd)" >> build.log
-          echo "Flutter version: $(flutter --version)" >> build.log
+          echo "PATH: $PATH" >> build.log
+          
+          # 确保 flutter 在 PATH 中
+          export PATH="$PATH:$HOME/flutter/bin"
+          echo "Flutter version: $(flutter --version 2>&1)" >> build.log
+          
           echo "=== Running: flutter build apk --release --split-per-abi --verbose ===" >> build.log
           # 运行构建并同时输出到控制台和日志文件
           flutter build apk --release --split-per-abi --verbose 2>&1 | tee -a build.log
