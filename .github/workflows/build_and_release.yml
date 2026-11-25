@@ -107,19 +107,39 @@ jobs:
         working-directory: .
         run: |
           set -x
-          # 使用更可靠的方式记录日志
-          flutter build apk --release --split-per-abi --verbose 2>&1 | tee build.log
-          # 检查构建是否成功
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          # 确保日志文件在开始时就存在
+          touch build.log
+          echo "=== Starting Flutter build at $(date) ===" >> build.log
+          echo "Working directory: $(pwd)" >> build.log
+          echo "Flutter version: $(flutter --version)" >> build.log
+          echo "=== Running: flutter build apk --release --split-per-abi --verbose ===" >> build.log
+          # 运行构建并同时输出到控制台和日志文件
+          flutter build apk --release --split-per-abi --verbose 2>&1 | tee -a build.log
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+          echo "=== Build finished with exit code: $BUILD_EXIT_CODE at $(date) ===" >> build.log
+          # 保存退出码到环境变量供后续步骤使用
+          echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE" >> $GITHUB_ENV
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
             echo "=== BUILD FAILED ===" >> build.log
-            echo "Exit code: ${PIPESTATUS[0]}" >> build.log
             exit 1
           fi
         env:
           FLUTTER_VERBOSE: 1
         continue-on-error: true
       
-      # 14. 上传构建日志（始终上传用于调试）
+      # 14. 确保构建日志文件存在（即使构建失败）
+      - name: Ensure build log exists
+        if: always()
+        run: |
+          if [ ! -f build.log ]; then
+            echo "=== build.log not found, creating minimal log ===" > build.log
+            echo "Build step may have failed before creating log file" >> build.log
+            echo "Working directory: $(pwd)" >> build.log
+            echo "Build exit code: ${{ env.BUILD_EXIT_CODE }}" >> build.log
+            ls -la >> build.log
+          fi
+      
+      # 15. 上传构建日志（始终上传用于调试）
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
