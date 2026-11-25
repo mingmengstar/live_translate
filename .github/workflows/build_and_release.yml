@@ -19,12 +19,12 @@ jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     
     steps:
       # 1. 检出代码
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
@@ -104,6 +104,7 @@ jobs:
       
       # 13. 构建 Release APK
       - name: Build APK
+        working-directory: .
         run: |
           set -x
           set -o pipefail
@@ -114,7 +115,7 @@ jobs:
       # 14. 上传构建日志（始终上传用于调试）
       - name: Upload build log
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: build-log
           path: build.log
@@ -137,7 +138,7 @@ jobs:
       
       # 16. 上传构建产物
       - name: Upload APK artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: release-apks
           path: |
