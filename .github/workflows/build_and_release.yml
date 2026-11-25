@@ -112,8 +112,20 @@ jobs:
           echo "Working directory: $(pwd)" >> build.log
           echo "PATH: $PATH" >> build.log
           
-          # 确保 flutter 在 PATH 中
-          export PATH="$PATH:$HOME/flutter/bin"
+          # 确保 flutter 在 PATH 中 - flutter-action 可能安装在不同位置
+          if [ -d "$HOME/flutter/bin" ]; then
+            export PATH="$PATH:$HOME/flutter/bin"
+            echo "Added $HOME/flutter/bin to PATH" >> build.log
+          elif [ -d "/opt/hostedtoolcache/flutter/3.44.0/bin" ]; then
+            export PATH="$PATH:/opt/hostedtoolcache/flutter/3.44.0/bin"
+            echo "Added /opt/hostedtoolcache/flutter/3.44.0/bin to PATH" >> build.log
+          elif command -v flutter >/dev/null 2>&1; then
+            echo "flutter already in PATH: $(which flutter)" >> build.log
+          else
+            echo "ERROR: flutter not found in any known location" >> build.log
+            find / -name "flutter" -type f 2>/dev/null | head -5 >> build.log
+          fi
+          
           echo "Flutter version: $(flutter --version 2>&1)" >> build.log
           
           echo "=== Running: flutter build apk --release --split-per-abi --verbose ===" >> build.log
