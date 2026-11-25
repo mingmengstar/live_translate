@@ -141,6 +141,21 @@ jobs:
           cat android/gradle.properties
           echo "=== app build.gradle.kts ==="
           cat android/app/build.gradle.kts | head -50
+          echo "=== root build.gradle.kts (compileSdk override) ==="
+          sed -n '25,60p' android/build.gradle.kts
+
+      # 13.5 诊断：确认各插件模块 compileSdk 覆盖是否生效
+      - name: Diagnose plugin compileSdk
+        run: |
+          echo "=== Check plugin AAR metadata compileSdk ==="
+          for p in $(find ~/.pub-cache/hosted/pub.dev -maxdepth 1 -type d -name "*flutt*" -o -maxdepth 1 -type d -name "system_audio*" 2>/dev/null); do
+            f="$p/android/build.gradle"
+            [ -f "$f" ] || f="$p/android/build.gradle.kts"
+            if [ -f "$f" ]; then
+              echo "--- $p ---"
+              grep -n -i "compileSdk" "$f" | head -5
+            fi
+          done
       
       # 13. 构建 Release APK
       - name: Build APK
