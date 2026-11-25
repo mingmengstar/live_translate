@@ -102,33 +102,38 @@ jobs:
           echo "=== app build.gradle.kts ==="
           cat android/app/build.gradle.kts | head -50
       
-      # 13. 构建 Release APK
+      # 13. 准备构建环境
+      - name: Prepare build environment
+        run: |
+          # 确保 flutter 在 PATH 中
+          if [ -d "$HOME/flutter/bin" ]; then
+            export PATH="$PATH:$HOME/flutter/bin"
+            echo "Added $HOME/flutter/bin to PATH"
+          elif [ -d "/opt/hostedtoolcache/flutter/3.44.0/bin" ]; then
+            export PATH="$PATH:/opt/hostedtoolcache/flutter/3.44.0/bin"
+            echo "Added /opt/hostedtoolcache/flutter/3.44.0/bin to PATH"
+          elif command -v flutter >/dev/null 2>&1; then
+            echo "flutter already in PATH: $(which flutter)"
+          else
+            echo "ERROR: flutter not found in any known location"
+            find / -name "flutter" -type f 2>/dev/null | head -5
+          fi
+          
+          # 验证 flutter 可用
+          flutter --version
+          
+          # 创建构建日志文件
+          touch build.log
+          echo "=== Build log created at $(date) ===" > build.log
+          echo "Working directory: $(pwd)" >> build.log
+          echo "PATH: $PATH" >> build.log
+      
+      # 14. 构建 Release APK
       - name: Build APK
         working-directory: .
         run: |
-          # 确保日志文件在开始时就存在
-          touch build.log
           echo "=== Starting Flutter build at $(date) ===" >> build.log
-          echo "Working directory: $(pwd)" >> build.log
-          echo "PATH: $PATH" >> build.log
           
-          # 确保 flutter 在 PATH 中 - flutter-action 可能安装在不同位置
-          if [ -d "$HOME/flutter/bin" ]; then
-            export PATH="$PATH:$HOME/flutter/bin"
-            echo "Added $HOME/flutter/bin to PATH" >> build.log
-          elif [ -d "/opt/hostedtoolcache/flutter/3.44.0/bin" ]; then
-            export PATH="$PATH:/opt/hostedtoolcache/flutter/3.44.0/bin"
-            echo "Added /opt/hostedtoolcache/flutter/3.44.0/bin to PATH" >> build.log
-          elif command -v flutter >/dev/null 2>&1; then
-            echo "flutter already in PATH: $(which flutter)" >> build.log
-          else
-            echo "ERROR: flutter not found in any known location" >> build.log
-            find / -name "flutter" -type f 2>/dev/null | head -5 >> build.log
-          fi
-          
-          echo "Flutter version: $(flutter --version 2>&1)" >> build.log
-          
-          echo "=== Running: flutter build apk --release --split-per-abi --verbose ===" >> build.log
           # 运行构建并同时输出到控制台和日志文件
           flutter build apk --release --split-per-abi --verbose 2>&1 | tee -a build.log
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
