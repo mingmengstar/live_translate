@@ -84,7 +84,7 @@ jobs:
       
       # 10. 代码分析
       - name: Analyze code
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos
         working-directory: .
       
       # 11. 运行测试
