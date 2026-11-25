@@ -60,7 +60,42 @@ jobs:
           # 验证版本
           flutter --version
       
-      # 6. 接受 Android licenses
+      # 6. 补齐 Android 引擎产物（关键修复：android-arm/flutter.jar 缺失导致 Kotlin 插件编译失败）
+      - name: Precache Android engine artifacts
+        run: |
+          ENGINE_DIR="$HOME/flutter/bin/cache/artifacts/engine"
+          # 先补齐（正常情况下这一步就够）
+          flutter precache --android --no-ios || true
+
+          # 兜底：Flutter 偶发会留下"目录存在但 flutter.jar 缺失"的残缺缓存，
+          # 此时 precache 会误认为已缓存而跳过下载，必须删掉残缺目录强制重下。
+          for abi in android-arm android-arm64 android-x64; do
+            if [ ! -f "$ENGINE_DIR/$abi/flutter.jar" ]; then
+              echo "Detected incomplete cache for $abi, forcing re-download..."
+              rm -rf "$ENGINE_DIR/$abi"
+              flutter precache --android --no-ios --force || true
+              break
+            fi
+          done
+
+          echo "=== Engine artifacts after precache ==="
+          ls -la "$ENGINE_DIR"
+
+          # 硬校验：Gradle 编译所有 Kotlin 插件都要 compileOnly 这个 flutter.jar
+          MISSING=0
+          for abi in android-arm android-arm64 android-x64; do
+            if [ ! -f "$ENGINE_DIR/$abi/flutter.jar" ]; then
+              echo "::error::FATAL: missing $ENGINE_DIR/$abi/flutter.jar"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "flutter.jar still missing after precache. Aborting before Gradle."
+            exit 1
+          fi
+          echo "All required flutter.jar artifacts present."
+
+      # 7. 接受 Android licenses
       - name: Accept Android licenses
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
@@ -130,7 +165,7 @@ jobs:
           fi
         env:
           FLUTTER_VERBOSE: 1
-        continue-on-error: true
+        # 注意：不再使用 continue-on-error，否则构建失败会被伪装成成功、artifact 为空也"上传成功"
       
       # 14. 确保构建日志文件存在（即使构建失败）
       - name: Ensure build log exists
@@ -150,14 +185,15 @@ jobs:
           echo "=== Full build/app/outputs tree ==="
           find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -30 || echo "No APKs found in build/app/outputs"
           # 保存找到的第一个 APK 路径供后续步骤使用
-          APK_PATH=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -1)
-          if [ -n "$APK_PATH" ]; then
-            echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
-            echo "First APK found at: $APK_PATH"
-          else
-            echo "WARNING: No APK found anywhere in build/app/outputs"
-            echo "APK_PATH=build/app/outputs/flutter-apk/*.apk" >> $GITHUB_ENV
+          APK_COUNT=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | wc -l)
+          echo "APK count: $APK_COUNT"
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No APK produced. Build silently failed, check build.log and the Build APK step."
+            exit 1
           fi
+          APK_PATH=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -1)
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+          echo "First APK found at: $APK_PATH"
       
       # 16. 上传构建产物
       - name: Upload APK artifacts
@@ -179,7 +215,12 @@ jobs:
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "name=Release $TAG" >> $GITHUB_OUTPUT
-          echo "body=$(git log --oneline -10)" >> $GITHUB_OUTPUT
+          # 多行输出必须使用 heredoc 分隔符，否则 GITHUB_OUTPUT 解析失败
+          {
+            echo 'body<<RELEASE_BODY_EOF'
+            git log --oneline -10
+            echo 'RELEASE_BODY_EOF'
+          } >> $GITHUB_OUTPUT
       
       # 18. 创建 GitHub Release 并上传 APK
       - name: Create Release

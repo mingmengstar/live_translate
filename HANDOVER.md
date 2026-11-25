@@ -121,7 +121,8 @@ android/
    - 推理（ASR/MT）必须在 **Isolate** 执行，避免阻塞 UI 线程。
    - 悬浮窗更新必须做 **100ms 防抖/节流**（已在 `TranslationService._scheduleDebouncedUpdate` 与 `OverlayScreen._debounceTimer` 双重保险）。
 3. **资源释放**：切引擎/关服务必须 `dispose()` 所有资源（EngineManager.disposeAll、AudioCaptureService.dispose、OverlayFlutterEngine 销毁 Engine）。
-4. **版本锁定**：Gradle 9.3.1 / AGP 9.1.1 / Kotlin 2.2.20 / Flutter 3.50+ / Dart 3.14+ —— 禁止随意升降级。
+4. **版本锁定**：Gradle 9.5.0 / AGP 9.3.1 / Kotlin 2.4.20 / Flutter 3.50+ / Dart 3.14+ —— 禁止随意升降级。
+   - 2026-11-26 变更：由 Gradle 9.3.1 / AGP 9.1.1 / Kotlin 2.2.20 升级至此组合，原因见第 9 节 CI 修复记录。
 5. **Mock 先行**：新增引擎必须同时提供 Mock 实现，便于 CI 无模型跑通全链路。
 
 ---
@@ -143,3 +144,75 @@ android/
 ---
 
 > **交接人提示**：当前 HEAD `f580a9f` 已包含 Gradle/AGP/Kotlin 版本修复，**首要任务是配置 PAT 推送触发 CI**，切勿在本地再次构建。
+
+---
+
+## 9. CI 排错记录（2026-11-26）
+
+### 第一次 CI 运行（tag `v0.1.0-ci-test`，Run #19）
+
+**结果：构建实际失败，但被工作流掩盖为"成功"。**
+
+| 步骤 | 真实结果 |
+|------|---------|
+| Checkout / Java 17 / Flutter 3.50.1 / pub get / analyze / test | ✅ 全部通过 |
+| Build APK | ❌ 失败（`BUILD_EXIT_CODE=1`） |
+| Upload artifacts | ⚠️ 显示成功但 `total_count=0` |
+| Prepare release notes | ❌ 失败 |
+| Create Release | ⏭️ 跳过 |
+
+### 根因 1：`android-arm/flutter.jar` 缺失（致命）
+
+```
+Execution failed for task ':system_audio_recorder:compileReleaseKotlin'.
+> Could not resolve all files for configuration ':system_audio_recorder:releaseCompileClasspath'.
+  > Failed to transform flutter.jar ...
+    > File/directory does not exist: .../artifacts/engine/android-arm/flutter.jar
+```
+
+Flutter 3.50.1 precache 只下载了 `*-profile` / `*-release` 变体，**基础 debug 变体 `android-arm` 的 `flutter.jar` 未下载**。所有应用 Kotlin Gradle Plugin 的插件（`flutter_foreground_task`、`quick_settings_with_flutter_plugins`、`system_audio_recorder`）编译时都需要 `compileOnly` 这个 jar。
+
+**修复**：工作流新增 `Precache Android engine artifacts` 步骤——
+1. `flutter precache --android --no-ios`
+2. 兜底：若 `flutter.jar` 仍缺失（残缺缓存导致 precache 误判已缓存），`rm -rf` 该 ABI 目录后 `--force` 重下
+3. 硬校验 `android-arm` / `android-arm64` / `android-x64` 三个 `flutter.jar` 存在，缺失则 `exit 1` 提前失败
+
+### 根因 2：`$GITHUB_OUTPUT` 多行值解析失败
+
+```
+##[error]Invalid format 'f580a9f build: fix Gradle/AGP/Kotlin versions for Flutter 3.50 compatibility'
+```
+
+`echo "body=$(git log --oneline -10)" >> $GITHUB_OUTPUT` 输出多行，GITHUB_OUTPUT 不接受裸多行值。
+
+**修复**：改用 heredoc 分隔符 `body<<RELEASE_BODY_EOF ... RELEASE_BODY_EOF`。
+
+### 根因 3：`continue-on-error: true` 掩盖真实失败
+
+Build APK 步骤带 `continue-on-error: true`，导致构建失败后仍继续执行、artifact 为空还"上传成功"、最终掩盖问题。
+
+**修复**：
+- 移除 `continue-on-error: true`
+- `Find APK files` 改为 `APK_COUNT == 0` 时 `exit 1` 显式失败（不再回退到通配符路径）
+
+### 顺带完成的版本升级
+
+Flutter 3.50.1 已对旧版本发出即将停止支持的警告：
+
+| 组件 | 旧 | 新 | 依据 |
+|------|----|----|------|
+| Gradle | 9.3.1 | **9.5.0** | AGP 9.3 最低要求 Gradle 9.5.0 |
+| AGP | 9.1.1 | **9.3.1** | Flutter 建议 ≥ 9.3.1 |
+| Kotlin | 2.2.20 | **2.4.20** | Flutter 建议 ≥ 2.4.20 |
+
+**已验证的风险点**：`gradle.properties` 中的 `android.builtInKotlin=false`、`android.newDsl=false` 在 AGP 9.3 仍受支持（AGP 10.0 才移除），升级不会立即破坏构建。但日志已提示应迁移到 Built-in Kotlin，**列为后续技术债**：
+
+> `Your app uses the following plugins that apply Kotlin Gradle Plugin (KGP): flutter_foreground_task, quick_settings_with_flutter_plugins, system_audio_recorder. Future versions of Flutter will fail to build if your app uses plugins that apply KGP.`
+
+### 遗留技术债（新增）
+
+| 优先级 | 问题 | 说明 |
+|--------|------|------|
+| P1 | 迁到 Built-in Kotlin | AGP 10 / 未来 Flutter 将强制要求，需 `android.builtInKotlin=true` + 移除 app 与插件的 KGP 应用 |
+| P1 | 三个插件未支持 Built-in Kotlin | `flutter_foreground_task`、`quick_settings_with_flutter_plugins`、`system_audio_recorder` 需升级或等上游适配 |
+| P2 | 无 Release 签名 | 仍用 debug 签名，正式发布前必须配置 keystore |
