@@ -3,7 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';
 import 'package:live_translate/core/tile/quick_settings_tile.dart';
-import 'package:live_translate/ui/main_screen.dart';
+import 'package:live_translate/ui/home_screen.dart';
 
 void main() {
   // 确保 Flutter 绑定初始化
@@ -107,7 +107,7 @@ class _LiveTranslateAppState extends State<LiveTranslateApp> {
         debugShowCheckedModeBanner: false,
         title: '实时翻译',
         theme: _buildDarkTheme(),
-        home: const MainScreen(),
+        home: const HomeScreen(),
       ),
     );
   }

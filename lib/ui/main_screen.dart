@@ -157,6 +157,25 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
       child: Row(
         children: [
+          // 返回按钮（作为二级页进入时显示）
+          if (Navigator.of(context).canPop())
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: InkWell(
+                onTap: () => Navigator.of(context).maybePop(),
+                borderRadius: BorderRadius.circular(10),
+                child: Container(
+                  width: 36,
+                  height: 36,
+                  alignment: Alignment.center,
+                  child: Icon(
+                    Icons.arrow_back_rounded,
+                    color: Colors.grey[400],
+                    size: 20,
+                  ),
+                ),
+              ),
+            ),
           // 应用图标和标题
           Container(
             padding: const EdgeInsets.all(8),
