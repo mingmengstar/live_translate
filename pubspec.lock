@@ -118,14 +118,6 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
-  flutter_foreground_task:
-    dependency: transitive
-    description:
-      name: flutter_foreground_task
-      sha256: "6cf10a27f5e344cd2ecad0752d3a5f4ec32846d82fda8753b3fe2480ebb832a3"
-      url: "https://pub.flutter-io.cn"
-    source: hosted
-    version: "6.5.0"
   flutter_lints:
     dependency: "direct dev"
     description:
@@ -629,14 +621,6 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "1.4.1"
-  system_audio_recorder:
-    dependency: "direct main"
-    description:
-      name: system_audio_recorder
-      sha256: ffe04f683904accbbcd54ea5c802aaac754b2e2ed65f05ad43403cea4e5f29e6
-      url: "https://pub.flutter-io.cn"
-    source: hosted
-    version: "0.0.1"
   term_glyph:
     dependency: transitive
     description:

@@ -48,6 +48,14 @@
             android:enabled="true"
             android:exported="false"
             android:process=":overlay" />
+
+        <!-- 系统音频内录前台服务（自研，替代损坏的 system_audio_recorder）
+             Android 14+ 必须声明 foregroundServiceType，否则启动即崩 -->
+        <service
+            android:name=".AudioCaptureService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
         
         <!-- 快捷设置磁贴服务 -->
         <service

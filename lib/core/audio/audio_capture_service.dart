@@ -2,20 +2,38 @@
 ///
 /// 职责：拿系统内录 PCM → 丢给 VAD isolate → 收到语音段 → 回调给 ASR。
 ///
-/// 相比上一版的关键变化：
-/// 1. **VAD 全部搬进 isolate**（`vad_isolate_worker`），主线程不再算 RMS / 拼缓冲。
-/// 2. 默认优先 **Silero VAD**（复用已声明依赖 sherpa_onnx，不新增插件），
+/// 本版关键变化：
+/// 1. **不再依赖 `system_audio_recorder` 插件**（0.0.1 版在 Android 14 上必崩，
+///    详见下方说明），改用本项目自研的 `AudioCaptureService.kt`
+///    + MethodChannel / EventChannel。
+/// 2. **VAD 全部搬进 isolate**（`vad_isolate_worker`），主线程不再算 RMS / 拼缓冲。
+/// 3. 默认优先 **Silero VAD**（复用已声明依赖 sherpa_onnx，不新增插件），
 ///    加载失败或未配置模型时自动降级到**自适应能量 VAD**。
-/// 3. 修掉了旧实现的 int16 符号扩展 bug（负样本被当正数，RMS 虚高 → 持续误触发）。
-/// 4. `stop()` 会 `flush()` 吐出最后一段，不会把用户刚说完的话丢掉。
-/// 5. `dispose()` 干净释放 isolate / 端口 / 流订阅（钢印级资源释放要求）。
+/// 4. 修掉了旧实现的 int16 符号扩展 bug（负样本被当正数，RMS 虚高 → 持续误触发）。
+/// 5. `stop()` 会 `flush()` 吐出最后一段，不会把用户刚说完的话丢掉。
+/// 6. `dispose()` 干净释放 isolate / 端口 / 流订阅（钢印级资源释放要求）。
+///
+/// ### 为什么弃用 system_audio_recorder 0.0.1
+///
+/// 该插件在 Android 14+ 有多处致命缺陷，导致用户点「录制整个屏幕」后**闪退**：
+/// - `ForegroundService` 未在插件清单声明（只写在 example 里），
+///   `startForegroundService()` 直接抛异常并被吞掉；
+/// - `ActivityCompat.requestPermissions(this as Activity, ...)` ——
+///   `this` 是 Service，必然 `ClassCastException`；
+/// - 前台通知未调用 `setSmallIcon()`，`startForeground()` 抛 "Invalid notification"；
+/// - 清单缺 `foregroundServiceType`，Android 14 抛
+///   `MissingForegroundServiceTypeException`；
+/// - 以上异常全被 `try/catch` 吞掉 → 前台服务从未真正启动 →
+///   `getMediaProjection()` 抛 `SecurityException` → **进程崩溃**。
+///
+/// 因此改为自研实现：严格按「先 `startForeground(TYPE_MEDIA_PROJECTION)`
+/// 再 `getMediaProjection()`」的顺序。
 library live_translate.core.audio.audio_capture_service;
 
 import 'dart:async';
 import 'dart:developer';
-import 'dart:typed_data';
 
-import 'package:system_audio_recorder/system_audio_recorder.dart';
+import 'package:flutter/services.dart';
 
 import 'vad/vad_service.dart';
 import 'vad/vad_types.dart';
@@ -28,6 +46,14 @@ class AudioCaptureService {
   static final AudioCaptureService _instance = AudioCaptureService._internal();
   factory AudioCaptureService() => _instance;
   AudioCaptureService._internal();
+
+  /// 原生内录控制通道（自研 AudioCaptureService.kt）
+  static const MethodChannel _controlChannel =
+      MethodChannel('live_translate/audio_capture');
+
+  /// 原生 PCM 数据流通道（20ms 一块，PCM16 单声道）
+  static const EventChannel _audioStreamChannel =
+      EventChannel('live_translate/audio_stream');
 
   // 配置
   VadConfig _config = const VadConfig();
@@ -63,6 +89,9 @@ class AudioCaptureService {
   /// 初始化音频捕获服务
   ///
   /// [sileroModelPath] 提供时优先使用 Silero VAD；为 null 则用能量 VAD。
+  ///
+  /// 注意：这里**不会**请求屏幕录制授权。授权由 [start] 在用户点击开始后触发，
+  /// 避免「一打开应用就弹录制选择框」。
   Future<void> initialize({
     VadConfig? config,
     String? sileroModelPath,
@@ -95,15 +124,7 @@ class AudioCaptureService {
       log('[AudioCapture] VAD isolate 未就绪，语音段将不可用', name: 'AudioCapture');
     }
 
-    // 请求录音权限（放在 VAD 之后，避免权限弹窗期间 VAD 启动超时）
-    final granted = await SystemAudioRecorder.requestRecord(
-      titleNotification: '实时翻译',
-      messageNotification: '正在录制系统音频用于翻译',
-    );
-    if (!granted) {
-      throw StateError('录音权限被拒绝');
-    }
-
+    // 屏幕录制授权推迟到 start() 中按需请求
     log(
       '[AudioCapture] 初始化完成: ${_config.sampleRate}Hz, '
       '${_config.frameDurationMs}ms/帧, VAD=${_vad.backend}',
@@ -112,39 +133,42 @@ class AudioCaptureService {
   }
 
   /// 开始捕获系统音频
+  ///
+  /// 用户主动触发；先弹屏幕录制授权框，授权成功后才启动前台服务。
   Future<void> start() async {
     if (_isRecording || _isStarting) return;
     _isStarting = true;
 
     try {
-      // 启动系统内录 (16kHz, 单声道, 16bit PCM)
-      final started = await SystemAudioRecorder.startRecord(
-        sampleRate: _config.sampleRate,
-        bufferSize: _config.samplesPerFrame,
-        toStream: true,
-        toFile: false,
+      // 1) 请求屏幕录制（系统内录）授权 —— 必须由用户手动确认
+      final granted = await _requestProjection();
+      if (!granted) {
+        throw StateError('未获得屏幕录制授权');
+      }
+
+      // 2) 启动前台服务并开始采集
+      final started = await _controlChannel.invokeMethod<bool>(
+        'startCapture',
+        {'sampleRate': _config.sampleRate},
       );
 
-      if (!started) {
+      if (started != true) {
         throw StateError('启动系统录音失败');
       }
 
       _isRecording = true;
       _vad.reset();
 
-      // 监听音频流（EventChannel）
-      _audioSubscription ??= SystemAudioRecorder.audioStream
-          .receiveBroadcastStream()
-          .map((dynamic data) => data as List<int>)
-          .listen(
-            _onAudioDataReceived,
-            onError: (Object error) {
-              log('[AudioCapture] 音频流错误: $error', name: 'AudioCapture');
-            },
-            onDone: () {
-              log('[AudioCapture] 音频流结束', name: 'AudioCapture');
-            },
-          );
+      // 3) 监听 PCM 数据流
+      _audioSubscription ??= _audioStreamChannel.receiveBroadcastStream().listen(
+        _onAudioDataReceived,
+        onError: (Object error) {
+          log('[AudioCapture] 音频流错误: $error', name: 'AudioCapture');
+        },
+        onDone: () {
+          log('[AudioCapture] 音频流结束', name: 'AudioCapture');
+        },
+      );
 
       log('[AudioCapture] 开始捕获系统音频', name: 'AudioCapture');
     } catch (e, stack) {
@@ -156,12 +180,32 @@ class AudioCaptureService {
     }
   }
 
+  /// 请求屏幕录制授权（系统弹窗由 MainActivity 处理）
+  Future<bool> _requestProjection() async {
+    try {
+      final granted =
+          await _controlChannel.invokeMethod<bool>('requestProjection');
+      return granted == true;
+    } on PlatformException catch (e) {
+      log('[AudioCapture] 请求屏幕录制授权失败: $e', name: 'AudioCapture');
+      return false;
+    } on MissingPluginException {
+      log('[AudioCapture] 原生内录通道不可用（非 Android 平台？）',
+          name: 'AudioCapture');
+      return false;
+    }
+  }
+
   /// 接收音频数据（从 EventChannel）
   ///
   /// 直接转给 VAD isolate，主线程零计算。
-  void _onAudioDataReceived(List<int> data) {
-    if (!_isRecording || data.isEmpty) return;
-    _vad.feed(Uint8List.fromList(data));
+  void _onAudioDataReceived(dynamic data) {
+    if (!_isRecording || data == null) return;
+    final Uint8List? pcm = data is Uint8List
+        ? data
+        : (data is List<int> ? Uint8List.fromList(data) : null);
+    if (pcm == null || pcm.isEmpty) return;
+    _vad.feed(pcm);
   }
 
   /// 停止捕获
@@ -172,7 +216,7 @@ class AudioCaptureService {
       await _audioSubscription?.cancel();
       _audioSubscription = null;
 
-      await SystemAudioRecorder.stopRecord();
+      await _controlChannel.invokeMethod<bool>('stopCapture');
 
       // 吐出缓冲区中残留的语音段（避免丢掉用户最后一句）
       _vad.flush();
