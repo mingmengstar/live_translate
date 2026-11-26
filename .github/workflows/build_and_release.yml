@@ -251,8 +251,9 @@ jobs:
             ${{ steps.release_notes.outputs.body }}
             
             ### 下载
-            - `app-release.apk` - 通用 APK (包含所有 ABI)
-            - `app-arm64-v8a-release.apk` - ARM64 设备
+            > 本次构建使用 `--split-per-abi`，仅提供分架构 APK，无通用包。
+
+            - `app-arm64-v8a-release.apk` - ARM64 设备（绝大多数现代手机）
             - `app-armeabi-v7a-release.apk` - ARM32 设备
             - `app-x86_64-release.apk` - x86_64 设备
             
@@ -264,7 +265,6 @@ jobs:
             5. 在快捷设置面板添加"实时翻译"磁贴
             6. 点击磁贴或应用内按钮开始实时翻译
           files: |
-            build/app/outputs/flutter-apk/app-release.apk
             build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
             build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
             build/app/outputs/flutter-apk/app-x86_64-release.apk
