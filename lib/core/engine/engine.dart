@@ -12,3 +12,7 @@ export 'engine_manager.dart';
 // Mock 实现（开发调试用）
 export 'mock_asr.dart';
 export 'mock_mt.dart';
+
+// 真实引擎（需要模型文件；加载失败自动降级 Mock）
+export 'sherpa_asr.dart';
+export 'llama_mt.dart';

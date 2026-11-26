@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart';
 import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/audio/audio_capture_service.dart';
+import 'package:live_translate/core/model/model_storage.dart';
 
 class TranslationService extends ChangeNotifier {
   final EngineManager _engineManager = EngineManager();
@@ -32,11 +33,17 @@ class TranslationService extends ChangeNotifier {
   // 当前识别的临时文本（用于显示中间结果）
   String _currentPartialText = '';
   String _currentTranslatedPartial = '';
-  
   // 语言设置
   String _asrLanguage = 'en';
   String _mtSourceLang = 'en';
   String _mtTargetLang = 'ja';
+  
+  // VAD 后端说明（初始化时写入，UI 可展示「当前用的是 Silero 还是能量 VAD」）
+  String? _vadBackendNote;
+
+  // 引擎选择说明（初始化时写入，说明为什么是 Mock / 真实引擎）
+  String? _engineNote;
+  
   
   // 获取器
   bool get isServiceRunning => _isServiceRunning;
@@ -49,42 +56,141 @@ class TranslationService extends ChangeNotifier {
   String get mtSourceLang => _mtSourceLang;
   String get mtTargetLang => _mtTargetLang;
   EngineManager get engineManager => _engineManager;
+
+  /// VAD 后端说明（如「Silero VAD 已加载」/「未提供 Silero 模型，使用能量 VAD」）
+  ///
+  /// 初始化前为 null；初始化后由 [AudioCaptureService.vadBackendNote] 填充。
+  String? get vadBackendNote => _vadBackendNote;
+
+  /// 引擎选择说明（为何当前是 Mock / 真实引擎，如「模型缺失（2/6），使用 Mock 引擎」）
+  String? get engineNote => _engineNote;
   
   /// 初始化服务：注册 Mock 引擎、初始化音频捕获
   Future<void> initialize() async {
     _updateStatus('正在初始化引擎...');
     
-    // 注册 Mock 引擎
+    // 注册 Mock 引擎（永远可用，作为兜底）
     _engineManager.registerASREngine('mock_asr', () => MockASR());
     _engineManager.registerMTEngine('mock_mt', () => MockMT());
-    
-    // 切换到 Mock 引擎
-    final asrOk = await _engineManager.switchASREngine(
-      engineId: 'mock_asr',
+
+    // 注册真实引擎（需要模型文件；initialize 失败会被 EngineManager 捕获并降级）
+    _engineManager.registerASREngine(
+      SherpaASREngine.kEngineId,
+      () => SherpaASREngine(),
+    );
+    _engineManager.registerMTEngine(
+      LlamaMTEngine.kEngineId,
+      () => LlamaMTEngine(),
+    );
+
+    // ---- 选择「用哪套引擎」----
+    //
+    // 策略：模型齐全就优先真实引擎，缺任何一件就整体回 Mock。
+    // 之所以「整体」而不是「ASR 真实 + MT Mock」混搭：
+    // 混搭时真实 ASR 出的文本会被 MockMT 加上 `【日】` 前缀，
+    // 看起来像「翻译坏了」，实际是 MT 是假的，排查成本很高。
+    // 宁可两边都 Mock，状态明确。
+    var asrEngineId = 'mock_asr';
+    var mtEngineId = 'mock_mt';
+    String? engineNote;
+
+    try {
+      final status = await ModelStorage.instance.inspect();
+      if (!status.hasError && status.isReady) {
+        asrEngineId = SherpaASREngine.kEngineId;
+        mtEngineId = LlamaMTEngine.kEngineId;
+        engineNote = '模型齐全，尝试加载真实引擎';
+      } else if (!status.hasError) {
+        engineNote = '模型缺失（${status.presentCount}/${status.totalCount}），'
+            '使用 Mock 引擎';
+      } else {
+        engineNote = '模型检测失败，使用 Mock 引擎';
+      }
+    } catch (e) {
+      engineNote = '模型检测异常，使用 Mock 引擎: $e';
+      log('[TranslationService] 模型检测失败: $e', name: 'TranslationService');
+    }
+
+    // 切换 ASR：真实引擎初始化失败时自动回落 Mock
+    var asrOk = await _engineManager.switchASREngine(
+      engineId: asrEngineId,
       config: {'language': _asrLanguage},
     );
-    
-    final mtOk = await _engineManager.switchMTEngine(
-      engineId: 'mock_mt',
+    if (!asrOk && asrEngineId != 'mock_asr') {
+      // 注意：switchASREngine 失败时已把 _currentASR 置 null，
+      // 这里拿不到失败实例的状态，只能给出通用说明。
+      engineNote = '真实 ASR 加载失败，已降级 Mock';
+      asrOk = await _engineManager.switchASREngine(
+        engineId: 'mock_asr',
+        config: {'language': _asrLanguage},
+      );
+    }
+
+    // 切换 MT：同样失败回落 Mock
+    var mtOk = await _engineManager.switchMTEngine(
+      engineId: mtEngineId,
       config: {
         'sourceLang': _mtSourceLang,
         'targetLang': _mtTargetLang,
       },
     );
-    
+    if (!mtOk && mtEngineId != 'mock_mt') {
+      engineNote = '真实 MT 加载失败，已降级 Mock';
+      mtOk = await _engineManager.switchMTEngine(
+        engineId: 'mock_mt',
+        config: {
+          'sourceLang': _mtSourceLang,
+          'targetLang': _mtTargetLang,
+        },
+      );
+    }
+
+    _engineNote = engineNote;
     // 初始化音频捕获服务
+    //
+    // 必须先解析 Silero VAD 模型路径再传进去，否则 VAD 会永远走能量后端：
+    // 下游 vad_types.dart 的 sileroModelPath 为 null 时，
+    // vad_isolate_worker.dart 的 `preferSilero && sileroModelPath != null`
+    // 永远不成立，模型哪怕下载好了也不会被加载。
+    // resolveVadModelPath() 在模型缺失时返回 null，此时自动降级能量 VAD，
+    // 不阻塞主流程。
+    String? vadModelPath;
+    try {
+      vadModelPath = await ModelStorage.instance.resolveVadModelPath();
+    } catch (e) {
+      // 平台通道不可用（单元测试 / 非 Android 环境）时不要中断初始化
+      log(
+        '[TranslationService] resolveVadModelPath 失败: $e',
+        name: 'TranslationService',
+      );
+    }
+
     await _audioCapture.initialize(
+      sileroModelPath: vadModelPath,
       onAudioSegment: _onAudioSegment,
     );
-    
+
+    // 把 VAD 后端结论暴露给 UI（首页 / 控制台可展示当前用的是 Silero 还是能量）
+    _vadBackendNote = _audioCapture.vadBackendNote;
+    log(
+      '[TranslationService] VAD 后端=${_audioCapture.vadBackend} '
+      'model=$vadModelPath note=$_vadBackendNote',
+      name: 'TranslationService',
+    );
+
     if (asrOk && mtOk) {
-      _updateStatus('引擎就绪 (Mock 模式)');
+      // 状态文案要反映真实引擎，不能固定写「Mock 模式」——
+      // 否则下载完全部模型、真实引擎已加载时，UI 还在说 Mock，
+      // 用户会以为下载没生效。
+      final isReal = _engineManager.currentASRId != 'mock_asr' &&
+          _engineManager.currentMTId != 'mock_mt';
+      _updateStatus(isReal ? '引擎就绪（真实引擎）' : '引擎就绪 (Mock 模式)');
       _lastError = null;
     } else {
       _lastError = '引擎初始化失败';
       _updateStatus('初始化失败');
     }
-    
+
     // 监听引擎变更
     _engineManager.addListener(_onEngineChanged);
   }

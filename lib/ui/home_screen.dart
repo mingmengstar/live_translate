@@ -385,6 +385,13 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 10),
           _buildInfoRow('MT 引擎', manager.currentMT?.displayName ?? '未加载'),
           const SizedBox(height: 10),
+          // VAD 后端：Silero 模型缺失会静默降级为能量 VAD，
+          // 这里显式暴露，避免用户困惑「为什么下载了模型切分还不准」。
+          _buildInfoRow('VAD 后端', service.vadBackendNote ?? '未初始化'),
+          const SizedBox(height: 10),
+          // 引擎说明：模型缺失 / 加载失败时会说明为何仍是 Mock
+          _buildInfoRow('引擎说明', service.engineNote ?? '未初始化'),
+          const SizedBox(height: 10),
           _buildInfoRow(
             '语言方向',
             '${service.mtSourceLang.toUpperCase()} → ${service.mtTargetLang.toUpperCase()}',
