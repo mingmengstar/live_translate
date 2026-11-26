@@ -117,9 +117,11 @@ class TranslationService extends ChangeNotifier {
       config: {'language': _asrLanguage},
     );
     if (!asrOk && asrEngineId != 'mock_asr') {
-      // 注意：switchASREngine 失败时已把 _currentASR 置 null，
-      // 这里拿不到失败实例的状态，只能给出通用说明。
-      engineNote = '真实 ASR 加载失败，已降级 Mock';
+      // switchASREngine 失败时已把 _currentASR 置 null，
+      // 但失败原因由 EngineManager.lastASRError 保留了，能给出具体说明。
+      final reason = _summarizeReason(_engineManager.lastASRError);
+      engineNote = '真实 ASR 加载失败，已降级 Mock'
+          '${reason == null ? '' : '（$reason）'}';
       asrOk = await _engineManager.switchASREngine(
         engineId: 'mock_asr',
         config: {'language': _asrLanguage},
@@ -135,7 +137,11 @@ class TranslationService extends ChangeNotifier {
       },
     );
     if (!mtOk && mtEngineId != 'mock_mt') {
-      engineNote = '真实 MT 加载失败，已降级 Mock';
+      // 这里最常见的原因就是「当前 ABI 的 APK 里没有 llama.cpp 原生库」，
+      // 旧文案只说「加载失败」，用户完全无从判断，必须带出具体原因。
+      final reason = _summarizeReason(_engineManager.lastMTError);
+      engineNote = '真实 MT 加载失败，已降级 Mock'
+          '${reason == null ? '' : '（$reason）'}';
       mtOk = await _engineManager.switchMTEngine(
         engineId: 'mock_mt',
         config: {
@@ -201,7 +207,41 @@ class TranslationService extends ChangeNotifier {
       _engineManager.pushAudioToASR(audioData);
     }
   }
-  
+
+  /// 把引擎的失败原因压成一句能塞进 UI 的短文本
+  ///
+  /// 引擎写进 `lastError` 的原因往往很长（含底层 FFI 报错、路径、堆栈提示），
+  /// 直接拼进 `engineNote` 会把界面撑爆。这里只保留「最关键的那一层含义」。
+  ///
+  /// 识别优先级：
+  /// 1. 原生库缺失（ABI 不匹配）—— 这是当前最可能的原因；
+  /// 2. 模型文件缺失；
+  /// 3. 其余情况截断原文。
+  String? _summarizeReason(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    final text = raw.trim();
+
+    if (text.contains('libllama.so') ||
+        text.contains('libmtmd.so') ||
+        text.contains('原生库')) {
+      // 用户看到这句就能自己去下对应架构的包，或换 arm64 设备
+      return '当前 APK 架构不含 llama.cpp 原生库，请用 arm64-v8a 版本';
+    }
+    if (text.contains('未检测到翻译模型') || text.contains('*.gguf')) {
+      return '未检测到翻译模型（*.gguf）';
+    }
+    if (text.contains('超时') || text.contains('Timeout')) {
+      return '加载超时';
+    }
+    if (text.contains('out of memory') || text.contains('OOM')) {
+      return '内存不足';
+    }
+
+    // 兜底：截到 60 字，避免把整段堆栈塞进状态栏
+    const maxLen = 60;
+    return text.length <= maxLen ? text : '${text.substring(0, maxLen)}…';
+  }
+
   void _onEngineChanged(EngineTypeEnum engineType, String? engineId) {
     final typeStr = engineType == EngineTypeEnum.asr ? 'ASR' : 'MT';
     _updateStatus(engineId != null ? '$typeStr 引擎已切换: $engineId' : '$typeStr 引擎已停止');

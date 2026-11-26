@@ -1,38 +1,50 @@
 /// Llama.cpp 本地翻译引擎（MT）
 ///
-/// 基于 `llama_cpp_dart 0.2.2` 的 [LlamaParent] + 独立 isolate 子进程，
-/// 加载 Hy-MT1.5-1.8B-GGUF 做端侧离线翻译。
+/// 基于 `llama_cpp_dart 0.9.0-dev.12` 的 [LlamaEngine]：
+/// `LlamaEngine.spawn()` 起一个 worker isolate，模型权重与 KV cache 都活在
+/// 那个 isolate 里，主 isolate 只收发事件流。
 ///
 /// ## 设计要点
-/// 1. **推理在独立 Isolate**：`LlamaParent` 内部通过 `typed_isolate`
-///    把 llama.cpp 调用放到 child isolate，主线程只收发字符串。
-/// 2. **流式输出**：`parent.stream` 每吐一个 token 就回调 [MTChunk]，
+///
+/// 1. **推理在独立 Isolate**：`LlamaEngine` 内部 `Isolate.spawn(runEngineWorker)`，
+///    FFI 绑定的 `LlamaLibrary.load()` 也在 worker 内调用（FFI 绑定是 per-isolate 的，
+///    主 isolate 不持有任何 native 句柄）。
+/// 2. **流式输出**：`session.generate()` 返回 `Stream<GenerationEvent>`，
+///    每来一个 [TokenEvent] 就把增量文本回调给上层 [MTChunk]，
 ///    上层 `TranslationService` 做 100ms 防抖后再推悬浮窗。
 /// 3. **失败自动降级**：任何一步失败（模型缺失 / 原生库缺失 / 加载超时）
-///    都抛异常，由 `EngineManager.switchMTEngine()` 捕获，
-///    上层再切回 `MockMT`，UI 红字提示，不崩溃。
+///    都抛异常，由 `EngineManager.switchMTEngine()` 捕获后降级回 `MockMT`，
+///    UI 用红字提示原因，不崩溃。
 ///
-/// ## ⚠️ 已知阻塞（Android 原生库缺失）
+/// ## 原生库是怎么进 APK 的（曾经的 P0 阻塞，现已解决）
 ///
-/// `llama_cpp_dart 0.2.2` 的 `pubspec.yaml` **没有 `flutter: plugin:` 段**，
-/// 包内也不含任何 Android `.so`（只有 OpenCL 的 `libOpenCL.so`）。
-/// 因此它的 `android/build.gradle`（依赖 `src/llama.cpp` 子模块 + CMake）
-/// **不会**进入 Flutter 的 Gradle 构建图，产物里没有 `libmtmd.so`。
+/// 旧版本 `0.2.2` 的 pubspec **没有 `flutter: plugin:` 段**，包内也不含任何
+/// Android `.so`，导致它的 `android/build.gradle` 根本不进 Flutter 的 Gradle
+/// 构建图，产物里没有 `libmtmd.so`，真机 `DynamicLibrary.open("libmtmd.so")`
+/// 必失败。
 ///
-/// 后果：`Llama.libraryPath = "libmtmd.so"` →
-/// `DynamicLibrary.open("libmtmd.so")` 在真机抛
-/// `Invalid argument(s): Failed to load dynamic library`。
+/// `0.9.0-dev.12` 改走 **native assets 构建钩子**（`hook/build.dart`），并自带
+/// `native/android/llama-cpp-dart.aar`，内含
+/// `jni/arm64-v8a/{libllama,libmtmd,libggml,libggml-base,libggml-cpu}.so`。
+/// Flutter 的 `nativeAssets` 特性在 stable 默认开启，`flutter assemble` 会把它们
+/// 解到 `build/.../native_assets/jniLibs/lib/<abi>/`，
+/// 再由 `CopyFlutterJniLibsTask` 复制进 APK 的 jniLibs —— 不需要改
+/// `android/app/build.gradle.kts`，也不需要 NDK/CMake。
 ///
-/// 本引擎因此会在 `initialize()` 阶段失败并降级回 `MockMT`。
-/// 要真正跑通，需要满足以下**任一**条件：
-/// - 上游发布带 `flutter: plugin:` 段 + 预编译 `.so` 的版本；
-/// - 或本项目自行用 NDK 编出 `libmtmd.so` 并放进
-///   `android/app/src/main/jniLibs/<abi>/`（需要 llama.cpp 源码 + CMake，
-///   属于 CI 侧改动，见 HANDOVER 第 5 节）。
+/// ### ⚠️ ABI 限制（重要）
+///
+/// 官方那个 AAR **只带 arm64-v8a**。因此：
+/// - `arm64-v8a` 的 APK 里有完整的 llama.cpp，真实翻译可用；
+/// - `armeabi-v7a` / `x86_64` 的 APK 里**没有**这些 `.so`，
+///   本引擎会在 `spawn()` 阶段失败并降级 `MockMT`（不崩溃，`engineNote` 会说明）。
+///
+/// 这是上游产物限制，不是本项目配置问题。若要补齐其他 ABI，
+/// 需在 CI 里自建 AAR 并放进 `jniLibs/`，属于后续优化项。
 library live_translate.core.engine.llama_mt;
 
 import 'dart:async';
 import 'dart:developer';
+import 'dart:io' show Platform;
 
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
 import 'package:live_translate/core/model/model_storage.dart';
@@ -98,13 +110,19 @@ class LlamaMTEngine implements MTEngine {
   // 运行期状态
   // ---------------------------------------------------------------------------
 
-  LlamaParent? _parent;
+  /// worker isolate 句柄（内部持有 native 模型与 context）
+  LlamaEngine? _engine;
+
+  /// 复用的会话（持有 token 历史与 KV 游标）
+  ///
+  /// 每句翻译前会 `clear()`，避免上下文无限增长导致 KV cache 打满。
+  EngineSession? _session;
 
   /// 模型权重绝对路径（initialize 时解析）
   String? _modelPath;
 
-  /// 当前正在进行的 promptId（用于过滤 stream 上的其他消息）
-  String? _activePromptId;
+  /// 当前正在消费的事件流订阅（用于 cancel）
+  StreamSubscription<GenerationEvent>? _activeSub;
 
   /// 流式累加缓冲
   final StringBuffer _buffer = StringBuffer();
@@ -118,6 +136,17 @@ class LlamaMTEngine implements MTEngine {
   /// 取消标记（stop / 新请求打断旧请求）
   bool _cancelled = false;
 
+  /// 单次生成最多产出多少 token（可在 config 覆盖）
+  int _maxTokens = 256;
+
+  /// 采样参数（每次 translate 复用，保持温度稳定）
+  SamplerParams _sampler = const SamplerParams(
+    temperature: 0.2,
+    topK: 20,
+    topP: 0.8,
+    repeatPenalty: 1.05,
+  );
+
   // 获取器
   bool get isModelReady => _modelReady;
 
@@ -125,11 +154,17 @@ class LlamaMTEngine implements MTEngine {
 
   String? get modelPath => _modelPath;
 
+  /// 当前平台是否可能有 llama.cpp 原生库
+  ///
+  /// 上游发布的 AAR 只含 Android arm64-v8a；桌面 / iOS 需要另配动态库。
+  /// 这个判断只用于 UI 上的诊断信息，真正的失败由 `spawn()` 抛出并被上层降级。
+  static bool get isNativeLibraryExpected => Platform.isAndroid;
+
   // ---------------------------------------------------------------------------
   // 生命周期
   // ---------------------------------------------------------------------------
 
-  /// 加载权重并初始化 llama.cpp
+  /// 加载权重并起 worker isolate
   ///
   /// 抛异常表示无法使用真实引擎，由调用方降级回 Mock。
   @override
@@ -158,60 +193,94 @@ class LlamaMTEngine implements MTEngine {
     // - nCtx 2048：一句字幕远用不到 4k，2048 足够且省内存
     // - nBatch / nUbatch 128：prompt 很短，batch 开大只是白占内存
     // - nThreads 4：留一半核给 UI / VAD / ASR，避免抢满卡顿
-    // - flashAttention：手机上救内存的关键开关
-    final contextParams = ContextParams()
-      ..nCtx = (config['nCtx'] as num?)?.toInt() ?? 2048
-      ..nBatch = 128
-      ..nUbatch = 128
-      ..nThreads = (config['nThreads'] as num?)?.toInt() ?? 4
-      ..nThreadsBatch = (config['nThreads'] as num?)?.toInt() ?? 4
-      // 单次最多生成多少 token（一句字幕 256 足够，超长会拖慢出字）
-      ..nPredict = (config['nPredict'] as num?)?.toInt() ?? 256
-      ..flashAttention = LlamaFlashAttnType.enabled;
+    // - flashAttn auto：交给 llama.cpp 决定。不要硬写 on ——
+    //   `FlashAttention.on` 在后端不支持时会直接报错。
+    final contextParams = ContextParams(
+      nCtx: (config['nCtx'] as num?)?.toInt() ?? 2048,
+      nBatch: 128,
+      nUbatch: 128,
+      nThreads: (config['nThreads'] as num?)?.toInt() ?? 4,
+      nThreadsBatch: (config['nThreads'] as num?)?.toInt() ?? 4,
+      flashAttn: FlashAttention.auto,
+    );
 
     // 3) 采样参数：翻译任务要「稳」，温度必须低
     //
     // 翻译不是创作，高温会让同一句话每次译得不一样，
     // 甚至凭空添加原文没有的内容。
-    final samplerParams = SamplerParams()
-      ..temp = (config['temperature'] as num?)?.toDouble() ?? 0.2
-      ..topK = 20
-      ..topP = 0.8
-      ..penaltyRepeat = 1.05;
+    _maxTokens = (config['maxTokens'] as num?)?.toInt() ??
+        // 兼容旧配置键（0.2.x 时代叫 nPredict，在 ContextParams 上）
+        (config['nPredict'] as num?)?.toInt() ??
+        256;
 
-    final loadCommand = LlamaLoad(
+    final temperature = (config['temperature'] as num?)?.toDouble() ?? 0.2;
+    _sampler = SamplerParams(
+      temperature: temperature,
+      topK: 20,
+      topP: 0.8,
+      repeatPenalty: 1.05,
+    );
+
+    // 4) 起 worker isolate 并加载权重
+    //
+    // `LlamaEngine.spawn` 不传 libraryPath 时用 `LlamaLibrary.defaultFileName()`，
+    // Android 上是裸名 `libllama.so` —— 走 linker 的 basename 解析，
+    // 正好命中 APK 里的 jniLibs，无需绝对路径。
+    // libmtmd 也会按 basename 打开（可选，失败不影响纯文本生成）。
+    final modelParams = ModelParams(
       path: _modelPath!,
-      modelParams: ModelParams(),
-      contextParams: contextParams,
-      samplingParams: samplerParams,
-      verbose: false,
+      // Android 侧只打了 ggml-cpu，没有 GPU/NPU 后端，必须是 0
+      gpuLayers: 0,
     );
 
     try {
-      _parent = LlamaParent(loadCommand);
-      // 30s 冷加载兜底（1.8B Q4 在低端机上可能更慢，
-      // 但无限等会让 UI 永远转圈）
-      await _parent!.init().timeout(
-            const Duration(seconds: 60),
-            onTimeout: () => throw TimeoutException('翻译模型加载超时（60s）'),
-          );
+      _engine = await LlamaEngine.spawn(
+        modelParams: modelParams,
+        contextParams: contextParams,
+      ).timeout(
+        // 1.8B Q4 在低端机上冷加载可能很慢，但无限等会让 UI 永远转圈
+        const Duration(seconds: 90),
+        onTimeout: () => throw TimeoutException('翻译模型加载超时（90s）'),
+      );
+
+      _session = await _engine!.createSession();
+
       _modelReady = true;
       isInitialized = true;
       log(
-        '[LlamaMT] 模型已加载: $_modelPath (nCtx=${contextParams.nCtx}, '
-        'threads=${contextParams.nThreads})',
+        '[LlamaMT] 模型已加载: $_modelPath '
+        '(nCtx=${contextParams.nCtx}, threads=${contextParams.nThreads}, '
+        'maxTokens=$_maxTokens, temp=$temperature)',
         name: 'LlamaMT',
       );
     } catch (e, s) {
-      _lastError = '翻译模型加载失败: $e';
+      _lastError = _describeLoadFailure(e);
       log('[LlamaMT] 初始化失败: $e\n$s', name: 'LlamaMT');
       _modelReady = false;
       isInitialized = false;
       // 失败时立刻释放，避免半初始化状态占着内存
-      await _parent?.dispose().catchError((_) {});
-      _parent = null;
-      rethrow;
+      await _teardownQuietly();
+      // 统一抛 StateError，让上层 / 测试拿到可读原因
+      throw StateError(_lastError!);
     }
+  }
+
+  /// 把底层异常翻译成用户能看懂的一句话
+  ///
+  /// 最常见的是「原生库不在包里」：`LlamaLibraryException: failed to open
+  /// libllama.so`，这在不同 ABI 的 APK 上必然出现（上游 AAR 只带 arm64）。
+  String _describeLoadFailure(Object e) {
+    final text = e.toString();
+    final looksLikeMissingNative = text.contains('libllama.so') ||
+        text.contains('libmtmd.so') ||
+        text.contains('failed to open') ||
+        text.contains('DynamicLibrary');
+
+    if (looksLikeMissingNative) {
+      return '翻译原生库加载失败（libllama.so / libmtmd.so）。'
+          '当前 APK 架构可能不含 llama.cpp（官方产物仅 arm64-v8a）：$e';
+    }
+    return '翻译模型加载失败: $e';
   }
 
   // ---------------------------------------------------------------------------
@@ -246,8 +315,8 @@ class LlamaMTEngine implements MTEngine {
     required Function(MTResult) onComplete,
     required Function(Object error, StackTrace stack) onError,
   }) async {
-    final parent = _parent;
-    if (parent == null || !_modelReady) {
+    final session = _session;
+    if (session == null || !_modelReady) {
       onError(StateError('LlamaMT 未就绪'), StackTrace.current);
       return;
     }
@@ -269,41 +338,65 @@ class LlamaMTEngine implements MTEngine {
     _buffer.clear();
     final startTime = DateTime.now();
 
-    // 订阅必须早于 sendPrompt，否则会漏掉最开始几个 token
-    final textSub = parent.stream.listen((chunk) {
-      if (_cancelled) return;
-      _buffer.write(chunk);
-      onChunk(
-        MTChunk(
-          text: _buffer.toString(),
-          isFinal: false,
-          chunkIndex: _buffer.length,
-        ),
-      );
-    });
-
     final done = Completer<void>();
-
-    final completionSub = parent.completions.listen((event) {
-      // promptId 对不上说明是上一次请求的残留，忽略
-      if (_activePromptId != null && event.promptId != _activePromptId) return;
-      if (!done.isCompleted) {
-        if (event.success) {
-          done.complete();
-        } else {
-          done.completeError(
-            StateError(event.errorDetails ?? '翻译生成失败'),
-          );
-        }
-      }
-    });
+    StreamSubscription<GenerationEvent>? sub;
 
     try {
-      _activePromptId = await parent.sendPrompt(_buildPrompt(text, targetLanguage));
-      await done.future.timeout(
-        const Duration(seconds: 30),
-        onTimeout: () => throw TimeoutException('翻译超时（30s）'),
+      // 每句都从干净上下文开始：不清的话 token 历史 + KV 会一路累加，
+      // 几十句之后必然撞上 nCtx 上限。
+      await session.clear();
+
+      final rawStream = session.generate(
+        prompt: _buildPrompt(text, targetLanguage),
+        // 模板里自带 <|startoftext|>，不要再让 tokenizer 加一遍
+        addSpecial: false,
+        sampler: _sampler,
+        maxTokens: _maxTokens,
       );
+
+      // 单次事件间隔兜底：低端机上 prefill 可能要几秒，
+      // 但 45s 都没有新 token 基本就是卡死，必须切断避免 UI 永久转圈。
+      final guarded = rawStream.timeout(
+        const Duration(seconds: 45),
+        onTimeout: (sink) {
+          sink.addError(TimeoutException('翻译超时（45s 无新 token）'));
+          sink.close();
+        },
+      );
+
+      sub = guarded.listen(
+        (event) {
+          if (_cancelled) return;
+          switch (event) {
+            case TokenEvent():
+              _buffer.write(event.text);
+              if (event.text.isEmpty) return;
+              onChunk(
+                MTChunk(
+                  text: _buffer.toString(),
+                  isFinal: false,
+                  chunkIndex: _buffer.length,
+                ),
+              );
+            case ShiftEvent():
+              // KV cache 被自动平移了；这里不镜像 token 列表，
+              // 因为每句都 clear()，不会累积到需要 shift 的长度。
+              log('[LlamaMT] context shifted', name: 'LlamaMT');
+            case DoneEvent():
+              if (!done.isCompleted) done.complete();
+          }
+        },
+        onError: (Object e, StackTrace st) {
+          if (!done.isCompleted) done.completeError(e, st);
+        },
+        onDone: () {
+          if (!done.isCompleted) done.complete();
+        },
+        cancelOnError: true,
+      );
+      _activeSub = sub;
+
+      await done.future;
 
       final translated = _buffer.toString().trim();
       final latency = DateTime.now().difference(startTime);
@@ -325,10 +418,13 @@ class LlamaMTEngine implements MTEngine {
       log('[LlamaMT] 翻译失败: $e\n$s', name: 'LlamaMT');
       onError(e, s);
     } finally {
-      _activePromptId = null;
+      _activeSub = null;
       isRunning = false;
-      await textSub.cancel();
-      await completionSub.cancel();
+      try {
+        await sub?.cancel();
+      } catch (_) {
+        // 取消本身失败不算错误
+      }
     }
   }
 
@@ -373,10 +469,15 @@ class LlamaMTEngine implements MTEngine {
   }
 
   /// 中断当前生成（新请求进来时先调，避免串台）
+  ///
+  /// 取消订阅会向 worker 发 `CancelCommand`，worker 在下一个 decode
+  /// 边界停下，不会继续白烧 CPU。
   Future<void> cancel() async {
     _cancelled = true;
+    final sub = _activeSub;
+    _activeSub = null;
     try {
-      await _parent?.stop();
+      await sub?.cancel();
     } catch (_) {
       // 忽略
     }
@@ -388,22 +489,41 @@ class LlamaMTEngine implements MTEngine {
     isRunning = false;
     isInitialized = false;
     _modelReady = false;
-    _activePromptId = null;
     _buffer.clear();
+    await _teardownQuietly();
+    log('[LlamaMT] 已释放', name: 'LlamaMT');
+  }
 
-    final parent = _parent;
-    _parent = null;
-    if (parent != null) {
+  /// 释放顺序：先取消流 → 再关 session → 最后销毁 engine
+  ///
+  /// `LlamaEngine.dispose()` 会向 worker 发 ShutdownCommand 并在 worker 内
+  /// 释放 model / context，所以必须在 session 之后。
+  Future<void> _teardownQuietly() async {
+    final sub = _activeSub;
+    _activeSub = null;
+    try {
+      await sub?.cancel();
+    } catch (_) {}
+
+    final session = _session;
+    _session = null;
+    if (session != null) {
       try {
-        await parent.dispose().timeout(
-              const Duration(seconds: 10),
-              onTimeout: () {},
-            );
+        await session.dispose().timeout(const Duration(seconds: 10));
       } catch (e) {
-        log('[LlamaMT] 释放失败: $e', name: 'LlamaMT');
+        log('[LlamaMT] session 释放失败: $e', name: 'LlamaMT');
       }
     }
-    log('[LlamaMT] 已释放', name: 'LlamaMT');
+
+    final engine = _engine;
+    _engine = null;
+    if (engine != null) {
+      try {
+        await engine.dispose().timeout(const Duration(seconds: 20));
+      } catch (e) {
+        log('[LlamaMT] engine 释放失败: $e', name: 'LlamaMT');
+      }
+    }
   }
 
   @override
@@ -418,6 +538,7 @@ class LlamaMTEngine implements MTEngine {
       'targetLanguage': targetLanguage,
       'modelPath': _modelPath,
       'error': _lastError,
+      'nativeLibraryExpected': isNativeLibraryExpected,
     };
   }
 }

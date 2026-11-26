@@ -41,6 +41,19 @@ class EngineManager {
   
   /// 当前 MT 引擎ID
   String? get currentMTId => _currentMT?.engineId;
+
+  /// 最近一次 ASR 切换失败的原因（成功后清空）
+  ///
+  /// 为什么需要它：`switchASREngine` 失败时会把 `_currentASR` 置 null，
+  /// 上层拿不到那个已销毁实例的 `lastError`，UI 只能显示「加载失败」。
+  /// 有了这个字段，UI 才能告诉用户「到底缺什么」——
+  /// 例如「原生库不在当前 ABI 的 APK 里」而不是笼统的失败。
+  String? get lastASRError => _lastASRError;
+  String? _lastASRError;
+
+  /// 最近一次 MT 切换失败的原因（成功后清空）
+  String? get lastMTError => _lastMTError;
+  String? _lastMTError;
   
   /// 是否有活跃的 ASR 引擎
   bool get hasActiveASR => _currentASR?.isRunning == true;
@@ -115,10 +128,13 @@ class EngineManager {
         config: config,
       );
       _currentASR = newEngine;
+      _lastASRError = null;
       _notifyListeners(EngineTypeEnum.asr, engineId);
       return true;
     } catch (e, stack) {
       log('Failed to initialize ASR engine $engineId: $e\n$stack', name: 'EngineManager');
+      // 在 dispose 之前先把原因留下来：dispose 后实例状态可能被清空
+      _lastASRError = _readEngineError(newEngine) ?? e.toString();
       await newEngine.dispose();
       _currentASR = null;
       _notifyListeners(asrType, null);
@@ -162,15 +178,40 @@ class EngineManager {
         config: config,
       );
       _currentMT = newEngine;
+      _lastMTError = null;
       _notifyListeners(EngineTypeEnum.mt, engineId);
       return true;
     } catch (e, stack) {
       log('Failed to initialize MT engine $engineId: $e\n$stack', name: 'EngineManager');
+      _lastMTError = _readEngineError(newEngine) ?? e.toString();
       await newEngine.dispose();
       _currentMT = null;
       _notifyListeners(mtType, null);
       return false;
     }
+  }
+
+  /// 从引擎的 `getStatus()['error']` 里读出可读原因
+  ///
+  /// 约定：两个真实引擎在 `initialize()` 失败时都会把人类可读的原因
+  /// 写进 `lastError` / `getStatus()['error']`，而抛出的异常本身可能是
+  /// 底层 FFI 报错（`failed to open libllama.so`），对用户不友好。
+  /// Mock 引擎没有这个字段，返回 null 由调用方回退到 `e.toString()`。
+  String? _readEngineError(Object engine) {
+    try {
+      if (engine is ASREngine) {
+        final status = engine.getStatus();
+        final error = status['error'];
+        if (error is String && error.trim().isNotEmpty) return error;
+      } else if (engine is MTEngine) {
+        final status = engine.getStatus();
+        final error = status['error'];
+        if (error is String && error.trim().isNotEmpty) return error;
+      }
+    } catch (_) {
+      // getStatus 本身出错不影响降级流程
+    }
+    return null;
   }
   
   /// 启动当前 ASR 引擎

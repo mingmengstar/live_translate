@@ -209,6 +209,63 @@ jobs:
           APK_PATH=$(find build/app/outputs -type f -name "*.apk" 2>/dev/null | head -1)
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
           echo "First APK found at: $APK_PATH"
+
+      # 15.5 硬校验：arm64 APK 里必须真的有 llama.cpp 原生库
+      #
+      # 为什么需要这一步：
+      # 历史上 P0-4（libmtmd.so 缺失）在 CI 上一直是绿的 —— 构建成功、APK 能出、
+      # 单测全过，只有真机跑到 LlamaMTEngine.initialize() 才失败。
+      # 所以「Build APK 成功」不能证明翻译可用，必须直接检查产物内容。
+      #
+      # 依赖说明：llama_cpp_dart 0.9.x 通过 native assets 钩子
+      # （hook/build.dart）+ 自带 AAR 提供这些 .so，Flutter 会把它们复制进
+      # APK 的 lib/<abi>/ 下。
+      # 上游 AAR 只含 arm64-v8a，所以这里只强制校验 arm64 包；
+      # armeabi-v7a / x86_64 包缺库属于已知限制，会让 MT 降级 Mock（不崩溃）。
+      - name: Verify llama.cpp native libs inside arm64 APK
+        run: |
+          set -u
+
+          ARM64_APK=$(find build/app/outputs -type f -name "*arm64-v8a*.apk" | head -1)
+          if [ -z "$ARM64_APK" ]; then
+            echo "::error::arm64-v8a APK not found; cannot verify native libs."
+            exit 1
+          fi
+          echo "Verifying: $ARM64_APK"
+
+          ENTRIES=$(unzip -l "$ARM64_APK" | awk '{print $4}')
+          echo "=== native libs in arm64 APK ==="
+          echo "$ENTRIES" | grep '^lib/.*\.so$' || echo "(none)"
+
+          MISSING=0
+          for so in libllama.so libmtmd.so libggml.so libggml-base.so libggml-cpu.so; do
+            if echo "$ENTRIES" | grep -q "lib/arm64-v8a/$so"; then
+              echo "OK   lib/arm64-v8a/$so"
+            else
+              echo "::error::MISSING lib/arm64-v8a/$so in arm64 APK"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "llama.cpp native libraries are missing from the arm64 APK."
+            echo "Root cause is usually the llama_cpp_dart native-assets hook not running,"
+            echo "or the resolved version no longer shipping native/android/llama-cpp-dart.aar."
+            exit 1
+          fi
+          echo "All required llama.cpp native libraries are present in the arm64 APK."
+
+      # 15.6 记录其他 ABI 的原生库情况（只提示，不失败）
+      #
+      # 上游 AAR 仅 arm64-v8a，armeabi-v7a / x86_64 上 MT 会自动降级 Mock。
+      # 这里打印出来，方便判断是否需要后续自建 AAR 补齐。
+      - name: Report native libs in other ABIs (informational)
+        run: |
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            [ -f "$apk" ] || continue
+            echo "=== $(basename "$apk") ==="
+            unzip -l "$apk" | awk '{print $4}' | grep '^lib/.*\.so$' || echo "(no .so)"
+          done
       
       # 16. 上传构建产物
       - name: Upload APK artifacts
