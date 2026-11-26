@@ -494,15 +494,28 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
   
   /// 语言设置卡片
+  ///
+  /// 三项选择共同决定「听到什么语言 → 翻译成什么语言」：
+  /// 识别语言必须等于实际说话的语言，源语言应与识别语言保持一致，
+  /// 否则会把已经识别对的文本按错误语种再翻译一遍。
   Widget _buildLanguageCard(BuildContext context, TranslationService service) {
     return _buildCard(
       title: '语言设置',
       icon: Icons.language_rounded,
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _buildSectionHint(
+            '决定「听什么语言、翻译成什么语言」。'
+            '系统内录本身不带语种信息，全靠这里的设置告诉识别与翻译引擎。',
+          ),
+          const SizedBox(height: 16),
+
           // ASR 语言选择
           _buildDropdownSetting(
             label: '识别语言 (ASR)',
+            hint: '告诉语音识别引擎：音频里说的是哪种语言。'
+                '选错会直接导致识别结果是乱码或无输出。',
             value: service.asrLanguage,
             items: const [
               DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
@@ -518,6 +531,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           // MT 源语言
           _buildDropdownSetting(
             label: '源语言 (MT)',
+            hint: '告诉翻译引擎：它拿到的文本原本是什么语言。'
+                '通常应与上面的识别语言保持一致，不一致会造成「中文再翻成中文」。',
             value: service.mtSourceLang,
             items: const [
               DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
@@ -533,6 +548,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           // MT 目标语言
           _buildDropdownSetting(
             label: '目标语言 (MT)',
+            hint: '告诉翻译引擎：要把文本翻译成哪种语言。'
+                '字幕与悬浮窗显示的就是这个语言的结果。',
             value: service.mtTargetLang,
             items: const [
               DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
@@ -546,12 +563,34 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
+
+  /// 卡片内的灰色说明文字（用于解释每个选择器的作用）
+  Widget _buildSectionHint(String text) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(Icons.info_outline_rounded, size: 14, color: Colors.grey[600]),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            text,
+            style: TextStyle(
+              color: Colors.grey[600],
+              fontSize: 11,
+              height: 1.6,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
   
   Widget _buildDropdownSetting({
     required String label,
     required String value,
     required List<DropdownMenuItem<String>> items,
     required ValueChanged<String?> onChanged,
+    String? hint,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -564,6 +603,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             fontWeight: FontWeight.w500,
           ),
         ),
+        if (hint != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            hint,
+            style: TextStyle(
+              color: Colors.grey[600],
+              fontSize: 11,
+              height: 1.5,
+            ),
+          ),
+        ],
         const SizedBox(height: 8),
         Container(
           width: double.infinity,
@@ -591,15 +641,28 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
   
   /// 引擎选择卡片
+  ///
+  /// 这里的选项是「用哪套实现来做识别 / 翻译」，
+  /// 与上面的语言设置是两件事：语言决定「听什么、译成什么」，
+  /// 引擎决定「用谁来做」。
   Widget _buildEngineCard(BuildContext context, TranslationService service) {
     return _buildCard(
       title: '引擎选择',
       icon: Icons.memory_rounded,
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _buildSectionHint(
+            '决定「由谁来完成识别和翻译」。'
+            'Mock 引擎只产生示例文本，用于在没有模型时验证整条链路；'
+            '真实引擎需要先导入或下载模型才能启用。',
+          ),
+          const SizedBox(height: 16),
+
           // ASR 引擎选择
           _buildEngineSelector(
             label: 'ASR 引擎',
+            hint: '把声音转成文字的组件。Mock 为演示实现，真实引擎为本地离线识别。',
             currentEngine: service.engineManager.currentASRId,
             availableEngines: service.engineManager.getRegisteredASREngines(),
             engineDisplayNames: {
@@ -613,6 +676,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           // MT 引擎选择
           _buildEngineSelector(
             label: 'MT 引擎',
+            hint: '把识别出的文字翻译成目标语言的组件。Mock 只加语言前缀，不做真正翻译。',
             currentEngine: service.engineManager.currentMTId,
             availableEngines: service.engineManager.getRegisteredMTEngines(),
             engineDisplayNames: {
@@ -631,6 +695,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     required List<String> availableEngines,
     required Map<String, String> engineDisplayNames,
     required ValueChanged<String> onChanged,
+    String? hint,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -643,6 +708,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             fontWeight: FontWeight.w500,
           ),
         ),
+        if (hint != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            hint,
+            style: TextStyle(
+              color: Colors.grey[600],
+              fontSize: 11,
+              height: 1.5,
+            ),
+          ),
+        ],
         const SizedBox(height: 8),
         Wrap(
           spacing: 8,
