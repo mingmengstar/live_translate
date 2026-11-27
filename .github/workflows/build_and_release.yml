@@ -267,6 +267,32 @@ jobs:
             unzip -l "$apk" | awk '{print $4}' | grep '^lib/.*\.so$' || echo "(no .so)"
           done
       
+      # 15.7 硬校验：overlayMain 必须真的进了 AOT 快照
+      #
+      # 为什么需要这一步：
+      # 这是真机上「悬浮窗窗口出来了但里面一片空白」的根因。
+      # flutter_screen_overlay 原生侧用
+      #   new DartEntrypoint(bundlePath, "overlayMain")
+      # 按**字符串名字**去 libapp.so 里找入口点；而 Dart 编译器是按
+      # import 图决定编译单元的 —— v0.3.4 时 overlay_screen.dart 全项目
+      # 零 import，整份文件没被编译，`@pragma('vm:entry-point')` 也救不回来。
+      #
+      # 这类问题的恶劣之处：构建成功、单测全过、Service 也起来，
+      # 只有真机才知道是白屏。所以必须直接检查产物内容。
+      #
+      # `flutter test` 里已有源码断言守住「main.dart 必须 import」，
+      # 但源码断言防不住「编译器的实际行为变了」。这里补上产物级证据。
+      - name: Verify overlayMain exists in AOT snapshot
+        run: |
+          set -u
+          ARM64_APK=$(find build/app/outputs -type f -name "*arm64-v8a*.apk" | head -1)
+          if [ -z "$ARM64_APK" ]; then
+            echo "::error::arm64-v8a APK not found; cannot verify overlay entrypoint."
+            exit 1
+          fi
+          echo "Verifying AOT snapshot in: $ARM64_APK"
+          python3 tools/verify_overlay_aot.py "$ARM64_APK"
+
       # 16. 上传构建产物
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4

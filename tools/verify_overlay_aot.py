@@ -15,14 +15,26 @@ v0.3.4 的事故就是：构建绿、单测全过、OverlayService 也起来了�
 
 结论：唯一可信的验证方式是打开 APK，从 libapp.so 里把字符串捞出来看。
 
-匹配方式
---------
-Dart AOT 快照里的字符串常量是 **UTF-16LE** 存的，直接按 ASCII/UTF-8
-搜会全部落空。因此这里用 utf-16-le 编码后再搜。
+匹配方式（这里有个致命细节，改前必读）
+------------------------------------
+Dart AOT 会把字符串常量按内容分成两种编码存进快照：
 
-同时必须带对照组：只搜「期望命中」的字符串，如果整个匹配逻辑写错了
-（比如编码搞错），会误判成「仍未修复」。所以每组都配一条
-「已知一定存在」的对照字符串，对照组不命中就说明脚本本身有问题。
+* **纯 ASCII**（整串都在 0x00-0x7F，如 `[Overlay] Lifecycle state`）
+  → 存成 **Latin-1 单字节**
+* **含非 ASCII**（如 `实时翻译 - 悬浮窗`）
+  → 存成 **UTF-16LE**
+
+这是 Dart VM 的 one-byte string 优化。所以「只用 utf-16-le 搜」
+会让所有纯 ASCII 字符串**恒定 miss** —— 那是假阴性，不是证据。
+
+历史教训：v0.3.4 的交接文档正是用 `utf-16-le` 去搜
+`[Overlay] Lifecycle state`（纯 ASCII），得到「缺失」结论。该条
+判据本身无效；真正有效的证据是同批中文串（`减小字号` 等）确实
+不在。到 v0.3.5 修复后，中文串全部命中 —— 那才是可采信的对比。
+
+因此本脚本对每条字符串**两种编码都试**，任一命中即视为存在。
+风险：ASCII 串按 latin-1 搜可能撞上别处的巧合字节。所以下面的
+REQUIRED 以中文串为主（编码唯一、不会误撞），ASCII 串只作补充。
 
 状态：PASS / FAIL / INCONCLUSIVE（脚本没能自证，不能算失败也不能算通过）
 
@@ -40,18 +52,31 @@ import zipfile
 LIB_PATH_IN_APK = "lib/arm64-v8a/libapp.so"
 
 # 必须命中：全部来自 lib/ui/overlay_screen.dart。
-# 每条都单独列出来是为了失败时能立刻看出「哪一段被砍了」。
+#
+# 以**中文串**为主：它们编码唯一（UTF-16LE），不会撞上别处的巧合字节，
+# 是真正可信的证据。ASCII 串只作补充，命中说明「有这个符号」，
+# 但不适合单独作为「已修复」的结论依据。
 REQUIRED = [
-    ("[Overlay] Initialized and listening for data", "overlay_screen._initializeOverlay"),
-    ("[Overlay] Lifecycle state", "overlay_screen.didChangeAppLifecycleState"),
     ("实时翻译 - 悬浮窗", "overlay_screen.OverlayApp.title"),
     ("减小字号", "overlay_screen 控制栏 tooltip"),
+    ("增大字号", "overlay_screen 控制栏 tooltip"),
     ("调节透明度", "overlay_screen 控制栏 tooltip"),
-    ("等待语音输入", "overlay_screen 空状态文案"),
+    # 必须带 U+2026 省略号：`main_screen.dart` 里有个几乎同形的
+    # `等待语音输入...`（三个 ASCII 句点）。只写前六个字会命中那份文件，
+    # 造成「修复前也 PASS」的假阳性。实测差异就在这个省略号上。
+    ("等待语音输入\u2026", "overlay_screen 空状态文案"),
+    ("[Overlay] Lifecycle state", "overlay_screen.didChangeAppLifecycleState"),
+    ("[Overlay] Data stream error", "overlay_screen.overlayListener.onError"),
 ]
 
-# 对照组：这些必须存在，用于证明「字符串确实在 libapp.so 里、编码没搞错」。
-# 若对照组缺失，本脚本的结论不可信，应当报 INCONCLUSIVE 而不是 FAIL。
+# 入口点符号表：这是最直接的判据。
+#
+# 原生侧按字符串名字注册/查找入口点，这个名字必须真的出现在快照的
+# 入口点符号表里。实测 v0.3.4 完全没有这个符号，v0.3.5 有了。
+ENTRYPOINT_SYMBOL = "overlayMain"
+
+# 对照组：这些必须存在，用于证明「文件选对了、搜索逻辑没坏」。
+# 若对照组缺失，本脚本的结论不可信，应报 INCONCLUSIVE 而不是 FAIL。
 CONTROL = [
     ("实时翻译正在运行", "overlay_controller.showOverlay(overlayTitle:)"),
     ("正在初始化引擎...", "main.dart _LoadingScreen"),
@@ -73,9 +98,22 @@ def load_libapp(apk_path: str, lib_override: str | None) -> bytes:
         return z.read(LIB_PATH_IN_APK)
 
 
-def probe(blob: bytes, text: str) -> bool:
-    """按 UTF-16LE 搜索（AOT 快照里字符串的真实编码）。"""
-    return blob.find(text.encode("utf-16-le")) != -1
+def probe(blob: bytes, text: str) -> tuple[bool, str]:
+    """在 AOT 快照里找字符串，返回 (是否命中, 命中的编码)。
+
+    Dart VM 对「全是 ASCII 的字符串」用 one-byte (Latin-1) 存储，
+    对含非 ASCII 的字符串用 TwoByte (UTF-16LE) 存储。所以必须两种都试，
+    否则纯 ASCII 串会恒 miss（v0.3.4 的判据就是这么失效的）。
+    """
+    if blob.find(text.encode("utf-16-le")) != -1:
+        return True, "utf-16le"
+    try:
+        if blob.find(text.encode("latin-1")) != -1:
+            return True, "latin-1"
+    except UnicodeEncodeError:
+        # 含非 ASCII 字符，不可能以 latin-1 单字节形式存在
+        pass
+    return False, ""
 
 
 def main() -> int:
@@ -94,8 +132,8 @@ def main() -> int:
     print("=== 对照组（必须存在，否则脚本结论不可信）===")
     control_ok = True
     for text, origin in CONTROL:
-        hit = probe(blob, text)
-        print(f"  [{'OK' if hit else 'MISS'}] {text!r}  <- {origin}")
+        hit, enc = probe(blob, text)
+        print(f"  [{'OK  ' + enc if hit else 'MISS':8}] {text!r}  <- {origin}")
         if not hit:
             control_ok = False
 
@@ -107,11 +145,26 @@ def main() -> int:
         print("RESULT=INCONCLUSIVE")
         return 3
 
+    print("\n=== 入口点符号表 ===")
+    # 对照组同时提供「main 必然存在」的基线，说明符号表的搜索方式是对的。
+    main_hit, _ = probe(blob, "main")
+    print(f"  [{'OK' if main_hit else 'MISS'}] {'main'!r}  <- 基线（对照组）")
+    ep_hit, ep_enc = probe(blob, ENTRYPOINT_SYMBOL)
+    print(f"  [{'OK  ' + ep_enc if ep_hit else 'MISS':8}] {ENTRYPOINT_SYMBOL!r}  <- 悬浮窗入口点")
+    if not main_hit:
+        print("\n连 'main' 都找不到，符号表搜索方式不可靠。")
+        print("RESULT=INCONCLUSIVE")
+        return 3
+    if not ep_hit:
+        print("\nFAIL: 入口点符号 overlayMain 不在快照里，原生侧按名字查不到它。")
+        print("RESULT=FAIL")
+        return 1
+
     print("\n=== 目标字符串（来自 overlay_screen.dart）===")
     missing = []
     for text, origin in REQUIRED:
-        hit = probe(blob, text)
-        print(f"  [{'OK' if hit else 'MISS'}] {text!r}  <- {origin}")
+        hit, enc = probe(blob, text)
+        print(f"  [{'OK  ' + enc if hit else 'MISS':8}] {text!r}  <- {origin}")
         if not hit:
             missing.append(text)
 
