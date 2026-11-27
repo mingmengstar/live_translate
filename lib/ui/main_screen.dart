@@ -22,6 +22,18 @@ bool _isTestEnvironment() {
 /// 测试环境标记，避免重复检测
 final bool _kIsTestEnvironment = _isTestEnvironment();
 
+/// 语言下拉框单个条目的固定高度（dp）
+///
+/// 为什么必须固定：`DropdownButton` 不设 `itemHeight` 时会按内容撑高，
+/// 12 个语种加起来远超一屏，菜单会被压到屏幕边缘并把每一项挤扁。
+const double kDropdownItemHeight = 48.0;
+
+/// 语言下拉菜单的最大高度（dp）
+///
+/// 约等于 6 项 + 上下 padding。超过这个高度就内部滚动，
+/// 保证菜单永远完整落在屏幕内，且三个下拉框行为一致。
+const double kDropdownMenuMaxHeight = kDropdownItemHeight * 6 + 16;
+
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
 
@@ -771,7 +783,14 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         .map(
           (language) => DropdownMenuItem<String>(
             value: language.code,
-            child: Text(language.displayLabel),
+            // 必须限制单行 + 省略：下拉项高度被 `itemHeight` 固定为
+            // [kDropdownItemHeight]，长标签（如「西班牙语 (Español)」）
+            // 在窄屏上换行会直接溢出。
+            child: Text(
+              language.displayLabel,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         )
         .toList(growable: false);
@@ -828,6 +847,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               items: items,
               onChanged: onChanged,
               borderRadius: BorderRadius.circular(12),
+              // ---- BUG-1 修复（v0.7.1）----
+              //
+              // 12 个语种全部展开时，菜单高度由内容撑开，会顶到屏幕边缘
+              // 并把每项压扁，且没有稳定的滚动约束 —— 真机表现为
+              // 「菜单出来了但滑不动，下面的语言根本选不到」。
+              //
+              // `itemHeight`：固定每项高度，是 `menuMaxHeight` 生效的前提
+              // （两者都不设时 DropdownButton 会退化成「按内容撑满」）。
+              // `menuMaxHeight`：把菜单限制在约 6 项高，超出部分内部滚动。
+              itemHeight: kDropdownItemHeight,
+              menuMaxHeight: kDropdownMenuMaxHeight,
             ),
           ),
         ),

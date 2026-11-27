@@ -71,6 +71,13 @@ class _HomeScreenState extends State<HomeScreen> {
               _buildBrandHeader(),
               const SizedBox(height: 24),
               _buildHeroCard(service),
+              // 悬浮窗异常提示：必须放在首屏，而不是藏在控制台页。
+              // 用户点「开始」后如果窗口没出来，第一眼就该看到原因，
+              // 否则只会得到「不知道它在哪里」这种无从排查的反馈（BUG-2）。
+              if (service.overlayNote != null) ...[
+                const SizedBox(height: 16),
+                _buildOverlayAlert(service),
+              ],
               const SizedBox(height: 16),
               _buildModelCard(),
               const SizedBox(height: 16),
@@ -240,6 +247,153 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
+  }
+
+  /// 悬浮窗异常提示条（首屏可见）
+  ///
+  /// ## 为什么必须有这一块（BUG-2）
+  ///
+  /// 真机复测时用户只说得出「点了开始没出现悬浮窗，不知道它在哪里」。
+  /// 原因是失败信息此前只写在控制台页的「服务状态」卡片里 —— 而用户
+  /// 点完开始往往就切到别的 App 了，根本不会再回来看这一行。
+  ///
+  /// 这里把三件事同时摆到首屏：
+  /// 1. 一句话结论（[TranslationService.overlayNote]）；
+  /// 2. 机器可读错误码（`PERMISSION` / `SERVICE_START` / `NOT_ATTACHED`），
+  ///    便于用户直接把码报回来，无需翻 logcat；
+  /// 3. 一个「重新显示」按钮，权限补授权后无需停止再启动。
+  ///
+  /// 错误码到人话的映射刻意放在 UI 层：`TranslationService` 只负责
+  /// 透传 code，不该关心怎么措辞。
+  Widget _buildOverlayAlert(TranslationService service) {
+    final code = service.overlayErrorCode;
+    final hint = _overlayCodeHint(code);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.orangeAccent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.layers_clear_rounded,
+                size: 16,
+                color: Colors.orangeAccent[200],
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '悬浮字幕未显示',
+                  style: TextStyle(
+                    color: Colors.orangeAccent[200],
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              if (code != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 7,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.orangeAccent.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    code,
+                    style: TextStyle(
+                      color: Colors.orangeAccent[100],
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            service.overlayNote!,
+            style: TextStyle(
+              color: Colors.grey[300],
+              fontSize: 12,
+              height: 1.6,
+            ),
+          ),
+          if (hint != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              hint,
+              style: TextStyle(
+                color: Colors.grey[500],
+                fontSize: 11,
+                height: 1.6,
+              ),
+            ),
+          ],
+          if (service.isServiceRunning) ...[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () async {
+                  final result = await service.retryOverlay();
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        result.ok
+                            ? '悬浮窗已显示'
+                            : '仍无法显示：${result.reason}',
+                      ),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.refresh_rounded, size: 16),
+                label: const Text('重新显示', style: TextStyle(fontSize: 12)),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.orangeAccent[200],
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 把悬浮窗错误码翻译成「用户下一步该做什么」
+  ///
+  /// 只覆盖悬浮窗结果里已知的几个错误码；未知码返回 null，
+  /// 让 `overlayNote` 的原文承担说明职责。
+  static String? _overlayCodeHint(String? code) {
+    switch (code) {
+      case 'PERMISSION':
+        return '请到「设置 → 应用 → 实时翻译 → 显示在其他应用上层」开启权限后，'
+            '回来点上面的「重新显示」。';
+      case 'SERVICE_START':
+        return '悬浮窗服务被系统拒绝启动。常见原因是应用刚切到后台触发了'
+            '后台启动限制，请把 App 切回前台再点「重新显示」。';
+      case 'NOT_ATTACHED':
+        return '窗口服务起来了但没有挂到屏幕上。通常是权限被系统临时收回，'
+            '请确认悬浮窗权限处于开启状态后重试。';
+      case 'IN_FLIGHT':
+        return '上一次显示还在进行中，稍等一秒再试。';
+      case 'NOT_RUNNING':
+        return '翻译服务未运行，先在控制台点开始。';
+      default:
+        return null;
+    }
   }
 
   Widget _buildTag(String label, IconData icon) {

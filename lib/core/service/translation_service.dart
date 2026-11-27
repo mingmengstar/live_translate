@@ -93,11 +93,41 @@ class TranslationService extends ChangeNotifier {
   /// 悬浮窗显示状态说明（失败时可直接展示给用户）
   String? _overlayNote;
 
+  /// 悬浮窗失败的机器可读错误码（`PERMISSION` / `SERVICE_START` /
+  /// `NOT_ATTACHED` / `EXCEPTION` / `IN_FLIGHT`，见 [OverlayShowResult.code]）
+  ///
+  /// 为什么要单独存一份而不是只留 [overlayNote]：
+  /// `reason` 是给人看的中文长句，真机复测时无法凭它判断到底是"权限没给"、
+  /// "服务被后台启动限制挡住"，还是"服务起来了但视图没挂上"——
+  /// 这三种的修法完全不同。把 code 一并透出，才能一眼定位。
+  String? _overlayErrorCode;
+
   /// 悬浮窗是否已显示
   bool get isOverlayVisible => _overlay.isShowing;
 
   /// 悬浮窗状态说明（如「未获得悬浮窗权限」）
   String? get overlayNote => _overlayNote;
+
+  /// 悬浮窗失败错误码（成功 / 未尝试时为 null）
+  String? get overlayErrorCode => _overlayErrorCode;
+
+  /// 把 [OverlayShowResult] 记录成「可展示给用户的说明 + 错误码」
+  ///
+  /// 收敛成一个私有方法，避免 4 处调用点各自写一遍 `ok ? null : reason`，
+  /// 漏掉 code 的赋值（这正是 BUG-2 排查困难的直接原因）。
+  void _applyOverlayResult(OverlayShowResult result) {
+    _overlayNote = result.ok ? null : result.reason;
+    _overlayErrorCode = result.ok ? null : result.code;
+  }
+
+  /// 清空悬浮窗的失败记录（窗口正常关闭 / 服务停止时调用）
+  ///
+  /// 两个字段必须一起清：只清 `_overlayNote` 会残留一个错误码，
+  /// 之后界面显示「未显示（NOT_ATTACHED）」这种自相矛盾的状态。
+  void _clearOverlayIssue() {
+    _overlayNote = null;
+    _overlayErrorCode = null;
+  }
 
   /// 当前悬浮窗显示设置（字号 / 透明度 / 位置）
   OverlaySettings get overlaySettings => OverlaySettingsStore.instance.current;
@@ -591,7 +621,7 @@ class TranslationService extends ChangeNotifier {
         // 用户主动收起：只关窗口，服务继续跑
         _overlayDismissedByUser = true;
         await _overlay.hide();
-        _overlayNote = null;
+        _clearOverlayIssue();
         notifyListeners();
 
       case OverlayCommand.stopService:
@@ -643,7 +673,7 @@ class TranslationService extends ChangeNotifier {
     await OverlaySettingsStore.instance.save(next);
 
     final result = await _overlay.reposition(next.position);
-    _overlayNote = result.ok ? null : result.reason;
+    _applyOverlayResult(result);
     if (!result.ok) {
       log(
         '[TranslationService] 切换位置后悬浮窗未能显示: ${result.reason}',
@@ -778,7 +808,7 @@ class TranslationService extends ChangeNotifier {
       log('TranslationService start error: $e\n$stack', name: 'TranslationService');
       // 启动失败时确保不会遗留一个假运行的悬浮窗
       await _overlay.hide();
-      _overlayNote = null;
+      _clearOverlayIssue();
       notifyListeners();
     }
   }
@@ -790,7 +820,7 @@ class TranslationService extends ChangeNotifier {
   Future<void> _syncOverlayWithServiceState() async {
     if (!_isServiceRunning) {
       await _overlay.hide();
-      _overlayNote = null;
+      _clearOverlayIssue();
       return;
     }
 
@@ -801,10 +831,13 @@ class TranslationService extends ChangeNotifier {
     }
 
     final result = await _overlay.show();
-    _overlayNote = result.ok ? null : result.reason;
+    _applyOverlayResult(result);
     if (!result.ok) {
+      // 把 code 一并打出来：真机复测时靠它区分「权限没给」/
+      // 「前台服务被后台启动限制挡住」/「服务起来了但 View 没挂上」。
       log(
-        '[TranslationService] 悬浮窗未能显示: ${result.reason}',
+        '[TranslationService] 悬浮窗未能显示: code=${result.code} '
+        'reason=${result.reason}',
         name: 'TranslationService',
       );
     } else {
@@ -823,13 +856,14 @@ class TranslationService extends ChangeNotifier {
     if (!_isServiceRunning) {
       return const OverlayShowResult(
         ok: false,
+        code: 'NOT_RUNNING',
         reason: '翻译服务未运行，悬浮窗无需显示',
       );
     }
     // 手动重试是用户的明确意图：即使之前点过「收起」，也应当重新显示。
     _overlayDismissedByUser = false;
     final result = await _overlay.show();
-    _overlayNote = result.ok ? null : result.reason;
+    _applyOverlayResult(result);
     if (result.ok) {
       await _pushOverlaySettings();
       await _pushOverlayState();
@@ -853,7 +887,7 @@ class TranslationService extends ChangeNotifier {
       // 先关悬浮窗：停止过程中引擎会清空字幕，
       // 若窗口还挂着会闪一下空的「等待语音输入...」再消失。
       await _overlay.hide();
-      _overlayNote = null;
+      _clearOverlayIssue();
       // 服务停了，「收起」这个意图就不再有意义，清掉，
       // 免得上一条收起状态残留到下一轮启动。
       _overlayDismissedByUser = false;
