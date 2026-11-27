@@ -11,6 +11,8 @@ import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/audio/audio_capture_service.dart';
 import 'package:live_translate/core/model/model_storage.dart';
 import 'package:live_translate/core/overlay/overlay_controller.dart';
+import 'package:live_translate/core/overlay/overlay_protocol.dart';
+import 'package:live_translate/core/overlay/overlay_settings.dart';
 
 class TranslationService extends ChangeNotifier {
   final EngineManager _engineManager = EngineManager();
@@ -42,9 +44,25 @@ class TranslationService extends ChangeNotifier {
   
   // VAD 后端说明（初始化时写入，UI 可展示「当前用的是 Silero 还是能量 VAD」）
   String? _vadBackendNote;
-
+  
   // 引擎选择说明（初始化时写入，说明为什么是 Mock / 真实引擎）
   String? _engineNote;
+
+  // ---- 悬浮窗反向控制 ----
+  //
+  // 订阅插件那条双向通道里「overlay → 主 App」方向的消息。
+  // 不订阅的话，悬浮窗上的按钮点了只会改它自己的本地快照，
+  // 主 App 完全不知道 —— 表现就是「点了隐藏，窗口还在」。
+  StreamSubscription<dynamic>? _overlayCommandSub;
+
+  /// 用户是否主动收起了悬浮窗（服务仍在跑）
+  ///
+  /// 与 `_overlay.isShowing` 分开记：
+  /// `isShowing` 是「窗口当前在不在」，这个是「用户想不想让它显示」。
+  /// 没有这个区别的话，用户点「收起」后只要有任何一次
+  /// `_syncOverlayWithServiceState()` 就会被重新拉出来，等于收起按钮失效。
+  bool _overlayDismissedByUser = false;
+  
   
   
   // 获取器
@@ -72,6 +90,12 @@ class TranslationService extends ChangeNotifier {
 
   /// 悬浮窗状态说明（如「未获得悬浮窗权限」）
   String? get overlayNote => _overlayNote;
+
+  /// 当前悬浮窗显示设置（字号 / 透明度 / 位置）
+  OverlaySettings get overlaySettings => OverlaySettingsStore.instance.current;
+
+  /// 用户是否主动收起了悬浮窗（服务仍在运行）
+  bool get isOverlayDismissedByUser => _overlayDismissedByUser;
 
   /// 引擎选择说明（为何当前是 Mock / 真实引擎，如「模型缺失（2/6），使用 Mock 引擎」）
   String? get engineNote => _engineNote;
@@ -211,6 +235,15 @@ class TranslationService extends ChangeNotifier {
     // 监听引擎变更
     _engineManager.addListener(_onEngineChanged);
 
+    // 恢复悬浮窗显示设置（字号 / 透明度 / 位置）
+    //
+    // 必须在 `_overlay.warmUp()` 之前：show() 要用 position 决定 gravity。
+    // 读取失败会静默退回默认值，不阻塞初始化。
+    await OverlaySettingsStore.instance.load();
+
+    // 订阅悬浮窗反向控制通道
+    _subscribeOverlayCommands();
+
     // 预热悬浮窗引擎
     //
     // 冷启动 overlayMain 大约要 5s（插件文档也提到这一点），
@@ -218,6 +251,173 @@ class TranslationService extends ChangeNotifier {
     // 的体感延迟。这里在 App 初始化阶段就建好引擎（此时用户还在首页），
     // 点开始时是热的。失败不影响功能，warmUp() 内部已吞掉异常。
     unawaited(_overlay.warmUp());
+  }
+
+  /// 订阅「overlay → 主 App」的控制命令
+  ///
+  /// 通道说明：`FlutterScreenOverlay.overlayListener` 与 `shareData()`
+  /// 共用插件那一条 `BasicMessageChannel`，但方向相反 ——
+  /// 这里收到的是**悬浮窗进程**发出来的消息。
+  ///
+  /// 注意 `overlayListener` 的 getter 内部会 `setMessageHandler`，
+  /// **每取一次就覆盖一次**。所以只能在这里订阅一次并保存
+  /// `StreamSubscription`；不要在多处调 `overlayListener`。
+  void _subscribeOverlayCommands() {
+    _overlayCommandSub?.cancel();
+    try {
+      _overlayCommandSub =
+          FlutterScreenOverlay.overlayListener.listen((dynamic data) {
+        if (data is! Map) return;
+        final command = readCommand(data);
+        if (command == null) {
+          log('[Overlay] 收到未知消息: $data', name: 'TranslationService');
+          return;
+        }
+        unawaited(_handleOverlayCommand(command));
+      });
+    } catch (e) {
+      // 测试环境 / 平台通道不可用：降级为「无反向控制」，不影响翻译主链路
+      log('[Overlay] 订阅控制通道失败: $e', name: 'TranslationService');
+    }
+  }
+
+  /// 处理来自悬浮窗的用户操作
+  ///
+  /// 每个分支都遵循同一个原则：**先改权威状态，再广播回去**。
+  /// 只改本地不广播的话，悬浮窗上显示的会是旧值（它自己先改了本地快照，
+  /// 但我们这边如果算出不同的结果——比如已经到上限——它就会一直显示错的）。
+  Future<void> _handleOverlayCommand(OverlayCommand command) async {
+    log('[Overlay] 收到命令: ${command.wire}', name: 'TranslationService');
+
+    switch (command) {
+      case OverlayCommand.requestSync:
+        // 悬浮窗刚起来（或被重建），把完整状态推过去
+        _overlayDismissedByUser = false;
+        await _pushOverlaySettings();
+        await _pushOverlayState();
+        // 窗口刚重建时字幕是空的，把最后一句话补回去，
+        // 否则用户切了个位置就看不到刚才的译文了。
+        _resendLastSubtitle();
+
+      case OverlayCommand.fontIncrease:
+        await _updateOverlaySettings(
+          OverlaySettingsStore.instance.current.withLargerFont,
+        );
+
+      case OverlayCommand.fontDecrease:
+        await _updateOverlaySettings(
+          OverlaySettingsStore.instance.current.withSmallerFont,
+        );
+
+      case OverlayCommand.cycleOpacity:
+        await _updateOverlaySettings(
+          OverlaySettingsStore.instance.current.withNextOpacity,
+        );
+
+      case OverlayCommand.cyclePosition:
+        await _cycleOverlayPosition();
+
+      case OverlayCommand.hideOverlay:
+        // 用户主动收起：只关窗口，服务继续跑
+        _overlayDismissedByUser = true;
+        await _overlay.hide();
+        _overlayNote = null;
+        notifyListeners();
+
+      case OverlayCommand.stopService:
+        // 完全停止：窗口在 stopService 内部先关，避免闪一条空字幕
+        _overlayDismissedByUser = false;
+        await stopService();
+    }
+  }
+
+  /// 保存设置并广播给悬浮窗
+  ///
+  /// 供 UI（主界面设置区）调用。悬浮窗自己调的是内部命令路径，
+  /// 但最终都会走到这里，保证「只有一个地方写设置」。
+  Future<void> updateOverlaySettings(OverlaySettings next) =>
+      _updateOverlaySettings(next);
+
+  /// 循环切换悬浮窗位置（供 UI 调用）
+  Future<void> cycleOverlayPosition() => _cycleOverlayPosition();
+
+  /// 保存设置并广播给悬浮窗
+  Future<void> _updateOverlaySettings(OverlaySettings next) async {
+    final store = OverlaySettingsStore.instance;
+    if (next == store.current) {
+      // 值没变（比如字号已到上限）：仍要广播一次。
+      // 悬浮窗是「先本地改再发命令」，它可能已经乐观地把字改大了，
+      // 不回一条正确值，界面就会停在一个不存在的字号上。
+      await _pushOverlaySettings();
+      return;
+    }
+    await store.save(next);
+    await _pushOverlaySettings();
+    notifyListeners();
+  }
+
+  /// 循环切换悬浮窗位置
+  ///
+  /// 位置只能靠关窗重开生效（gravity 不可原地改），
+  /// 而重开后 overlay 会发 `requestSync` 回来，所以这里不用额外推状态。
+  Future<void> _cycleOverlayPosition() async {
+    if (!_isServiceRunning || _overlayDismissedByUser) {
+      // 窗口没显示时也允许改设置，留着下次显示用
+      final next = OverlaySettingsStore.instance.current.withNextPosition;
+      await OverlaySettingsStore.instance.save(next);
+      notifyListeners();
+      return;
+    }
+
+    final next = OverlaySettingsStore.instance.current.withNextPosition;
+    await OverlaySettingsStore.instance.save(next);
+
+    final result = await _overlay.reposition(next.position);
+    _overlayNote = result.ok ? null : result.reason;
+    if (!result.ok) {
+      log(
+        '[TranslationService] 切换位置后悬浮窗未能显示: ${result.reason}',
+        name: 'TranslationService',
+      );
+    }
+    notifyListeners();
+  }
+
+  /// 把当前设置推给悬浮窗
+  Future<void> _pushOverlaySettings() async {
+    try {
+      await FlutterScreenOverlay.shareData({
+        'type': OverlayMessageType.settings,
+        ...OverlaySettingsStore.instance.current.toMap(),
+      });
+    } catch (e) {
+      log('[Overlay] 推送设置失败: $e', name: 'TranslationService');
+    }
+  }
+
+  /// 把服务运行状态推给悬浮窗
+  Future<void> _pushOverlayState() async {
+    try {
+      await FlutterScreenOverlay.shareData({
+        'type': OverlayMessageType.state,
+        'serviceRunning': _isServiceRunning,
+      });
+    } catch (e) {
+      log('[Overlay] 推送状态失败: $e', name: 'TranslationService');
+    }
+  }
+
+  /// 把最后一句话重新推给刚重建的悬浮窗
+  ///
+  /// 窗口重建后 overlay widget 是全新的，字幕已经清空。
+  /// 不补这一下，用户点「切换位置」就会看到字幕消失。
+  void _resendLastSubtitle() {
+    if (_subtitleBuffer.isEmpty) return;
+    final last = _subtitleBuffer.first;
+    _pendingSourceText = last.sourceText;
+    _pendingTranslatedText = last.translatedText;
+    _pendingIsFinal = last.isFinal;
+    _sendToOverlay();
   }
 
   /// 音频段回调（来自 VAD）
@@ -286,6 +486,9 @@ class TranslationService extends ChangeNotifier {
 
       _isServiceRunning = true;
       _subtitleBuffer.clear();
+      // 新一轮服务：把「用户主动收起」的意图清掉，
+      // 否则上一轮收起过，这一轮点了开始却看不到悬浮窗。
+      _overlayDismissedByUser = false;
 
       // 显示悬浮字幕窗口
       //
@@ -318,6 +521,12 @@ class TranslationService extends ChangeNotifier {
       return;
     }
 
+    // 用户主动收起了悬浮窗：尊重这个意图，不要把窗口硬拉出来。
+    // 否则「收起」按钮等于无效 —— 只要任何一次同步就会重新弹出。
+    if (_overlayDismissedByUser) {
+      return;
+    }
+
     final result = await _overlay.show();
     _overlayNote = result.ok ? null : result.reason;
     if (!result.ok) {
@@ -325,6 +534,11 @@ class TranslationService extends ChangeNotifier {
         '[TranslationService] 悬浮窗未能显示: ${result.reason}',
         name: 'TranslationService',
       );
+    } else {
+      // 窗口刚开：overlay 那边是全新的（甚至连引擎都是刚热的），
+      // 不会自己知道当前服务状态和设置，主动推一遍。
+      await _pushOverlaySettings();
+      await _pushOverlayState();
     }
   }
 
@@ -339,8 +553,15 @@ class TranslationService extends ChangeNotifier {
         reason: '翻译服务未运行，悬浮窗无需显示',
       );
     }
+    // 手动重试是用户的明确意图：即使之前点过「收起」，也应当重新显示。
+    _overlayDismissedByUser = false;
     final result = await _overlay.show();
     _overlayNote = result.ok ? null : result.reason;
+    if (result.ok) {
+      await _pushOverlaySettings();
+      await _pushOverlayState();
+      _resendLastSubtitle();
+    }
     notifyListeners();
     return result;
   }
@@ -356,6 +577,9 @@ class TranslationService extends ChangeNotifier {
       // 若窗口还挂着会闪一下空的「等待语音输入...」再消失。
       await _overlay.hide();
       _overlayNote = null;
+      // 服务停了，「收起」这个意图就不再有意义，清掉，
+      // 免得上一条收起状态残留到下一轮启动。
+      _overlayDismissedByUser = false;
 
       await _engineManager.stopASR();
       
@@ -506,6 +730,9 @@ class TranslationService extends ChangeNotifier {
   void _sendToOverlay() {
     try {
       FlutterScreenOverlay.shareData({
+        // 必须带 type：主 → overlay 方向上除了字幕，还有 settings / state，
+        // 不带类型的话 overlay 只能靠「有没有 sourceText 字段」猜，很脆。
+        'type': OverlayMessageType.subtitle,
         'sourceText': _pendingSourceText,
         'translatedText': _pendingTranslatedText,
         'isFinal': _pendingIsFinal,
@@ -575,6 +802,7 @@ class TranslationService extends ChangeNotifier {
   @override
   void dispose() {
     _debounceTimer?.cancel();
+    _overlayCommandSub?.cancel();
     _engineManager.removeListener(_onEngineChanged);
     // 先同步关窗（不 await，dispose 是同步的），
     // 避免 App 退出后系统里残留一条无主的悬浮字幕条。

@@ -12,6 +12,7 @@ library live_translate.test.overlay_channel_test;
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:live_translate/core/overlay/overlay_protocol.dart';
 
 /// 去掉 Dart 的 `//`、`///` 行注释与 `/* */` 块注释
 ///
@@ -187,6 +188,136 @@ void main() {
             .hasMatch(overlayScreen),
         true,
         reason: '@pragma 必须直接修饰 overlayMain 函数',
+      );
+    });
+  });
+
+  group('悬浮窗反向控制通道', () {
+    // 这一组守的是「双向通道」这条链路的**结构性约束**。
+    // 行为测试拿不到两个 FlutterEngine 之间的通信，只能断言源码结构。
+
+    test('主 App 必须订阅 overlayListener（否则悬浮窗按钮点了没反应）', () {
+      final service = stripDartComments(
+        File('lib/core/service/translation_service.dart').readAsStringSync(),
+      );
+      expect(
+        service.contains('FlutterScreenOverlay.overlayListener'),
+        true,
+        reason: '不订阅 overlayListener，overlay → 主 App 的命令收不到，'
+            '「隐藏 / 停止 / 切位置」全部失效',
+      );
+      // 订阅必须被保存下来，否则无法在 dispose 里取消（泄漏 handler）
+      expect(
+        service.contains('_overlayCommandSub'),
+        true,
+        reason: '订阅必须保存为可取消的字段',
+      );
+    });
+
+    test('主 App 必须能处理全部命令（switch 缺分支会编译失败，这里防语义遗漏）', () {
+      final service = stripDartComments(
+        File('lib/core/service/translation_service.dart').readAsStringSync(),
+      );
+      for (final c in OverlayCommand.values) {
+        // 用 wire 字符串而不是枚举名，锁的是「协议里能表达的命令」都有处理
+        expect(
+          service.contains('OverlayCommand.${c.name}'),
+          true,
+          reason: '命令 ${c.wire} 没有处理分支',
+        );
+      }
+    });
+
+    test('隐藏/停止必须由主 App 执行，overlay 侧只能发命令', () {
+      final overlayScreen = stripDartComments(
+        File('lib/ui/overlay_screen.dart').readAsStringSync(),
+      );
+      // overlay 里出现 closeOverlay/showOverlay 会破坏单一所有权
+      expect(
+        overlayScreen.contains('closeOverlay('),
+        false,
+        reason: 'overlay 自己关窗会拆掉承载当前 State 的引擎',
+      );
+      expect(
+        overlayScreen.contains('showOverlay('),
+        false,
+      );
+      // 但必须真的把命令发出去
+      expect(
+        overlayScreen.contains('OverlayCommand.hideOverlay'),
+        true,
+        reason: '收起按钮必须发命令回主 App',
+      );
+      expect(
+        overlayScreen.contains('OverlayCommand.stopService'),
+        true,
+      );
+    });
+
+    test('overlay 必须能接收 settings / state（否则重建窗口后设置丢失）', () {
+      final overlayScreen = stripDartComments(
+        File('lib/ui/overlay_screen.dart').readAsStringSync(),
+      );
+      expect(
+        overlayScreen.contains('OverlayMessageType.settings'),
+        true,
+        reason: '收不到 settings，切位置重建窗口后字号/透明度会跳回默认',
+      );
+      expect(
+        overlayScreen.contains('OverlayMessageType.state'),
+        true,
+      );
+      // 起来时要主动要一份状态
+      expect(
+        overlayScreen.contains('OverlayCommand.requestSync'),
+        true,
+        reason: 'overlay 起来必须 requestSync，否则用默认值覆盖用户设置',
+      );
+    });
+
+    test('两端必须共用同一份协议定义（不允许各写一份字面量）', () {
+      // 两个引擎各自编译，字段名对不上编译器不会报错。
+      // 唯一可靠的保证是：字段名字面量只出现在 overlay_protocol.dart 里。
+      final protocol = File('lib/core/overlay/overlay_protocol.dart');
+      expect(protocol.existsSync(), true);
+
+      for (final f in [
+        'lib/ui/overlay_screen.dart',
+        'lib/core/service/translation_service.dart',
+      ]) {
+        final src = stripDartComments(File(f).readAsStringSync());
+        // 只允许通过常量引用，不允许直接写 'stopService' 之类的裸字符串
+        expect(
+          RegExp(r"'stopService'").hasMatch(src),
+          false,
+          reason: '$f 里出现了裸命令字符串，应改用 OverlayCommand.wire',
+        );
+        expect(
+          RegExp(r"'fontIncrease'").hasMatch(src),
+          false,
+          reason: '$f 里出现了裸命令字符串，应改用 OverlayCommand.wire',
+        );
+      }
+    });
+
+    test('位置切换必须走 reposition（关窗重开），不能用 moveOverlay 冒充', () {
+      final controller = stripDartComments(
+        File('lib/core/overlay/overlay_controller.dart').readAsStringSync(),
+      );
+      expect(
+        controller.contains('Future<OverlayShowResult> reposition('),
+        true,
+        reason: '换位置需要关窗重开（gravity 只能建窗口时指定）',
+      );
+      expect(
+        controller.contains('moveOverlay('),
+        false,
+        reason: 'moveOverlay 只改像素偏移、不改 gravity，用它换位置是假实现',
+      );
+      // show() 必须接受位置参数，否则 reposition 无从生效
+      expect(
+        controller.contains('SubtitlePosition? position'),
+        true,
       );
     });
   });

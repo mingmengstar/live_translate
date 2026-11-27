@@ -9,6 +9,24 @@
 /// 这里只负责「在已经存在的窗口里画字幕条、响应按钮」，
 /// 绝不允许调用 `showOverlay()` / `closeOverlay()`。
 ///
+/// 需要关窗或切位置时，发命令给主 App，由主 App 执行。
+///
+/// ## 本文件是「无状态渲染器」（本轮重构的核心）
+///
+/// 这里的 `_fontSize` / `_opacity` / `_sourceText` **都不是权威值**，
+/// 只是主 App 推过来的快照。理由：
+///
+/// overlay 的 widget 树会随着窗口重建而**整体重建**（`onDestroy` 里
+/// `detachOverlayView()`，下次 `showOverlay()` 再 `new FlutterView`）。
+/// 用户点「切换位置」就会触发一次重建。若设置只活在这个 State 里，
+/// 重建后字号会跳回 16、字幕会清空 —— 用户看到的就是「点一下位置，
+/// 我调好的字号没了」。
+///
+/// 所以：
+/// - 启动时立刻 `requestSync`，向主 App 要当前设置与状态；
+/// - 每次改设置都**同时**告诉主 App（它会持久化）；
+/// - 收到主 App 的 `settings` / `state` 消息就覆盖本地快照。
+///
 /// ## 窗口尺寸假设
 ///
 /// 窗口不是全屏，而是 `OverlayController` 算出来的「字幕条」尺寸
@@ -17,11 +35,18 @@
 library live_translate.ui.overlay_screen;
 
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:live_translate/core/overlay/overlay_protocol.dart';
+import 'package:live_translate/core/overlay/overlay_settings.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart' as overlay;
 
 /// 悬浮窗入口点（必须标记为 vm:entry-point）
+///
+/// 注意：这个 `@pragma` 只能防止「已进编译图」的函数被 tree-shake，
+/// 它**不能**把一份没被任何文件 import 的文件拉进编译图。
+/// 真正保证它进 AOT 的是 `lib/main.dart` 里的 import + `kEmbeddedEntrypoints`。
 @pragma('vm:entry-point')
 void overlayMain() {
   // 设置系统 UI 覆盖样式
@@ -62,20 +87,16 @@ class OverlayScreen extends StatefulWidget {
 
 class _OverlayScreenState extends State<OverlayScreen>
     with WidgetsBindingObserver {
-  /// 字号可调范围
-  static const double _minFontSize = 12.0;
-  static const double _maxFontSize = 24.0;
-
-  /// 当前显示的文本
+  /// 当前字幕
   String _sourceText = '';
   String _translatedText = '';
   bool _isFinal = false;
 
-  /// 字号设置（默认 16sp）
-  double _fontSize = 16.0;
+  /// 服务是否在运行（主 App 推过来；用于决定是否显示「点击开始」提示）
+  bool _serviceRunning = false;
 
-  /// 透明度
-  double _opacity = 0.95;
+  /// 显示设置（主 App 是权威，这里是快照）
+  OverlaySettings _settings = const OverlaySettings();
 
   /// 数据监听订阅
   StreamSubscription<dynamic>? _dataSubscription;
@@ -104,10 +125,9 @@ class _OverlayScreenState extends State<OverlayScreen>
   /// 初始化悬浮窗数据监听
   Future<void> _initializeOverlay() async {
     try {
-      // 监听主引擎发送的共享数据
       _dataSubscription = overlay.FlutterScreenOverlay.overlayListener.listen(
-        (dynamic data) => _onDataReceived(data),
-        onError: (error) {
+        _onDataReceived,
+        onError: (Object error) {
           debugPrint('[Overlay] Data stream error: $error');
         },
         onDone: () {
@@ -116,32 +136,81 @@ class _OverlayScreenState extends State<OverlayScreen>
       );
 
       debugPrint('[Overlay] Initialized and listening for data');
+
+      // 主动要一份当前状态。
+      //
+      // 不发这条的话，经过「切位置 / 系统回收引擎」之后重建的这个 widget
+      // 会停在默认字号 16 / 默认透明度，而主 App 里记的是用户调过的值。
+      await _sendCommand(OverlayCommand.requestSync);
     } catch (e, stack) {
       debugPrint('[Overlay] Initialization error: $e\n$stack');
     }
   }
 
-  /// 接收主引擎发送的数据
+  /// 给主 App 发命令
+  Future<void> _sendCommand(OverlayCommand command) async {
+    try {
+      await overlay.FlutterScreenOverlay.shareData(
+        buildCommandMessage(command),
+      );
+      debugPrint('[Overlay] Sent command: ${command.wire}');
+    } catch (e) {
+      // 主 App 可能已经退出；发不出去不影响本地渲染
+      debugPrint('[Overlay] Send command failed (${command.wire}): $e');
+    }
+  }
+
+  /// 接收主 App 发来的消息
   ///
   /// 注意字段类型：`shareData()` 走 JSONMessageCodec，反序列化后
-  /// 最外层是 `Map<Object?, Object?>`，直接
-  /// `as Map<String, dynamic>` 在部分情况下会抛 cast 异常。
-  /// 这里改用宽松读取。
+  /// 最外层是 `Map<Object?, Object?>`，直接 `as Map<String, dynamic>`
+  /// 在部分情况下会抛 cast 异常。这里全部用宽松读取。
   void _onDataReceived(dynamic data) {
     if (data is! Map) {
       debugPrint('[Overlay] Ignored non-map payload: $data');
       return;
     }
 
-    final sourceText = data['sourceText'] as String? ?? '';
-    final translatedText = data['translatedText'] as String? ?? '';
-    final isFinal = data['isFinal'] as bool? ?? false;
+    final type = data['type'];
+    switch (type) {
+      case OverlayMessageType.settings:
+        _applySettings(data);
+      case OverlayMessageType.state:
+        _applyState(data);
+      case OverlayMessageType.subtitle:
+        _applySubtitle(data);
+      default:
+        // 兼容旧格式（没有 type 字段，直接就是字幕字段）。
+        // 主 App 和 overlay 引擎可能不同步（一个是旧进程），
+        // 这时宁可当成字幕渲染，也不要让屏幕一直空着。
+        if (data.containsKey('sourceText') ||
+            data.containsKey('translatedText')) {
+          _applySubtitle(data);
+        } else {
+          debugPrint('[Overlay] Ignored unknown payload type=$type');
+        }
+    }
+  }
+
+  void _applySettings(Map<Object?, Object?> data) {
+    final next = OverlaySettings.fromMap(data);
+    if (next == _settings) return;
+    debugPrint('[Overlay] Settings applied: $next');
+    setState(() => _settings = next);
+  }
+
+  void _applyState(Map<Object?, Object?> data) {
+    final running = data['serviceRunning'] as bool? ?? false;
+    if (running == _serviceRunning) return;
+    setState(() => _serviceRunning = running);
+  }
+
+  void _applySubtitle(Map<Object?, Object?> data) {
+    _pendingSource = data['sourceText'] as String? ?? '';
+    _pendingTranslated = data['translatedText'] as String? ?? '';
+    _pendingFinal = data['isFinal'] as bool? ?? false;
 
     // 防抖处理（双重保险，主引擎已有 100ms 节流）
-    _pendingSource = sourceText;
-    _pendingTranslated = translatedText;
-    _pendingFinal = isFinal;
-
     _debounceTimer?.cancel();
     _debounceTimer = Timer(const Duration(milliseconds: 50), () {
       if (!mounted) return;
@@ -153,24 +222,42 @@ class _OverlayScreenState extends State<OverlayScreen>
     });
   }
 
-  /// 更新字号
-  void _updateFontSize(double size) {
-    final next = size.clamp(_minFontSize, _maxFontSize);
-    if (next == _fontSize) return;
-    setState(() => _fontSize = next);
+  /// 改字号
+  ///
+  /// 先本地生效（用户立刻看到反馈），再通知主 App 持久化。
+  /// 这样即使与主 App 的通信失败，本次窗口生命周期内手感也是对的。
+  Future<void> _changeFont({required bool larger}) async {
+    final next = larger ? _settings.withLargerFont : _settings.withSmallerFont;
+    if (next == _settings) return;
+    setState(() => _settings = next);
+    await _sendCommand(
+      larger ? OverlayCommand.fontIncrease : OverlayCommand.fontDecrease,
+    );
   }
 
-  /// 更新透明度
-  void _updateOpacity(double opacity) {
-    setState(() => _opacity = opacity.clamp(0.3, 1.0));
+  /// 循环透明度
+  Future<void> _cycleOpacity() async {
+    final next = _settings.withNextOpacity;
+    setState(() => _settings = next);
+    await _sendCommand(OverlayCommand.cycleOpacity);
   }
 
-  /// 循环切换透明度
-  void _cycleOpacity() {
-    const levels = [0.6, 0.8, 0.95, 1.0];
-    final currentIndex = levels.indexWhere((l) => (_opacity - l).abs() < 0.05);
-    final nextIndex = (currentIndex + 1) % levels.length;
-    _updateOpacity(levels[nextIndex]);
+  /// 切位置
+  ///
+  /// 本文件**不能**自己关窗重开（会把承载当前 State 的引擎一起拆掉，
+  /// 必然 setState-after-dispose）。所以只发命令，由主 App 执行。
+  Future<void> _cyclePosition() async {
+    await _sendCommand(OverlayCommand.cyclePosition);
+  }
+
+  /// 请求主 App 停止服务（连悬浮窗一起收）
+  Future<void> _requestStop() async {
+    await _sendCommand(OverlayCommand.stopService);
+  }
+
+  /// 仅收起悬浮窗，服务继续跑
+  Future<void> _requestHide() async {
+    await _sendCommand(OverlayCommand.hideOverlay);
   }
 
   @override
@@ -184,7 +271,7 @@ class _OverlayScreenState extends State<OverlayScreen>
     return Material(
       color: Colors.transparent,
       child: AnimatedOpacity(
-        opacity: _opacity,
+        opacity: _settings.opacity,
         duration: const Duration(milliseconds: 200),
         child: Container(
           decoration: BoxDecoration(
@@ -244,10 +331,10 @@ class _OverlayScreenState extends State<OverlayScreen>
             Icon(Icons.translate_rounded, size: 18, color: Colors.grey[600]),
             const SizedBox(width: 8),
             Text(
-              '等待语音输入…',
+              _serviceRunning ? '等待语音输入…' : '翻译服务未运行',
               style: TextStyle(
                 color: Colors.grey[500],
-                fontSize: _fontSize * 0.85,
+                fontSize: _settings.fontSize * 0.85,
               ),
             ),
           ],
@@ -282,19 +369,13 @@ class _OverlayScreenState extends State<OverlayScreen>
 
   /// 顶部控制栏
   ///
-  /// 只保留「真能生效且不会破坏窗口生命周期」的三个操作：
-  /// 字号 -、字号 +、透明度循环。
+  /// 按钮分两类，行为有本质区别：
   ///
-  /// 为什么没有「隐藏」按钮：悬浮窗是一块 180dp 高的实体窗口，
-  /// 单纯把内容变透明**仍然会拦截整条区域的触摸**（用户会在屏幕
-  /// 底部点不动任何东西）。要真正隐藏必须关窗口，而关窗口属于
-  /// 主 App 的职责（见文件头注释）。停止/隐藏请回主 App 操作。
-  ///
-  /// 为什么没有「切换位置」按钮：位置是 `showOverlay()` 的
-  /// `alignment`（gravity）参数，只在创建窗口时生效；
-  /// `moveOverlay()` 改的是 `params.x/y` 像素偏移，不是 gravity，
-  /// 在 overlay 进程里用它「假装」换位置会与主 App 记录的状态不一致。
-  /// 位置选择将随「反向控制通道」一起实现。
+  /// - **本地可生效**：字号 ±、透明度、位置指示。
+  ///   其中位置只是「显示当前在哪」，真正换位置要把命令发回主 App
+  ///   重建窗口（`moveOverlay` 改的是像素偏移，不是 gravity）。
+  /// - **必须回主 App 执行**：隐藏、停止。
+  ///   overlay 自己 closeOverlay 会拆掉自己的引擎。
   Widget _buildControlBar() {
     return Container(
       height: 34,
@@ -329,24 +410,51 @@ class _OverlayScreenState extends State<OverlayScreen>
           ),
           _buildIconButton(
             icon: Icons.text_decrease_rounded,
-            onTap: () => _updateFontSize(_fontSize - 1),
+            onTap: () => _changeFont(larger: false),
             tooltip: '减小字号',
-            enabled: _fontSize > _minFontSize,
+            enabled: _settings.canDecreaseFont,
           ),
           _buildIconButton(
             icon: Icons.text_increase_rounded,
-            onTap: () => _updateFontSize(_fontSize + 1),
+            onTap: () => _changeFont(larger: true),
             tooltip: '增大字号',
-            enabled: _fontSize < _maxFontSize,
+            enabled: _settings.canIncreaseFont,
           ),
           _buildIconButton(
             icon: Icons.opacity_rounded,
             onTap: _cycleOpacity,
             tooltip: '调节透明度',
           ),
+          // 位置：图标即「当前在哪」，点一下换下一个位置
+          _buildIconButton(
+            icon: _positionIcon,
+            onTap: _cyclePosition,
+            tooltip: '切换位置（当前：${_settings.position.label}）',
+          ),
+          _buildIconButton(
+            icon: Icons.visibility_off_rounded,
+            onTap: _requestHide,
+            tooltip: '收起悬浮窗（服务继续运行）',
+          ),
+          _buildIconButton(
+            icon: Icons.stop_circle_outlined,
+            onTap: _requestStop,
+            tooltip: '停止翻译',
+          ),
         ],
       ),
     );
+  }
+
+  IconData get _positionIcon {
+    switch (_settings.position) {
+      case SubtitlePosition.top:
+        return Icons.vertical_align_top_rounded;
+      case SubtitlePosition.center:
+        return Icons.vertical_align_center_rounded;
+      case SubtitlePosition.bottom:
+        return Icons.vertical_align_bottom_rounded;
+    }
   }
 
   Widget _buildIconButton({
@@ -397,7 +505,7 @@ class _OverlayScreenState extends State<OverlayScreen>
                 label,
                 style: TextStyle(
                   color: Colors.grey[500],
-                  fontSize: _fontSize * 0.65,
+                  fontSize: _settings.fontSize * 0.65,
                   fontWeight: FontWeight.w500,
                 ),
               ),
@@ -405,7 +513,7 @@ class _OverlayScreenState extends State<OverlayScreen>
                 text,
                 style: TextStyle(
                   color: color,
-                  fontSize: _fontSize,
+                  fontSize: _settings.fontSize,
                   height: 1.35,
                   fontWeight: FontWeight.w400,
                 ),

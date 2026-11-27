@@ -19,6 +19,7 @@ import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart' as overlay;
+import 'package:live_translate/core/overlay/overlay_settings.dart';
 
 /// 悬浮窗显示结果
 class OverlayShowResult {
@@ -144,12 +145,16 @@ class OverlayController {
   ///    否则字幕条上的字号 / 透明度 / 关闭按钮全部点不动。
   ///    （`clickThrough` 会让触摸穿透，那样按钮也点不到，勿用。）
   ///
-  /// 4. `enableDrag: false`：位置由我们自己的「切换位置」按钮控制，
-  ///    避免用户误拖后与 alignment 状态不一致。
+  /// 4. `enableDrag: false`：位置由设置里的 [SubtitlePosition] 决定，
+  ///    避免用户误拖后与状态不一致。
   ///
   /// 5. `wakeScreen: false`：翻译是被动旁路，不该点亮锁屏。
+  ///
+  /// 6. **位置来自 `settings.position`**：`showOverlay()` 的 `alignment`
+  ///    只在创建窗口时生效，`moveOverlay()` 只改 x/y 像素偏移、不改
+  ///    gravity。所以「换位置」必然是一次关窗 + 开窗（见 [reposition]）。
   Future<OverlayShowResult> show({
-    overlay.OverlayAlignment alignment = overlay.OverlayAlignment.bottomCenter,
+    SubtitlePosition? position,
   }) async {
     if (_isShowing) {
       return OverlayShowResult.success;
@@ -170,6 +175,8 @@ class OverlayController {
         ? 1.0
         : PlatformDispatcher.instance.views.first.devicePixelRatio;
     final size = _targetSizeDp();
+    final alignment = (position ?? OverlaySettingsStore.instance.current.position)
+        .alignment;
 
     try {
       await overlay.FlutterScreenOverlay.showOverlay(
@@ -205,8 +212,13 @@ class OverlayController {
   }
 
   /// 关闭悬浮字幕窗口
+  ///
+  /// 刻意**不**做 `if (!_isShowing) return` 的短路：
+  /// `_isShowing` 只是本对象的内存标记，而窗口可能已被系统回收、或
+  /// 用户从最近任务划掉 App 后残留。此时标记是 true 但窗口其实没了，
+  /// 短路就会让「本次的关闭意图」被忽略。`closeOverlay()` 在窗口不存在时
+  /// 本身是安全的（插件里判断了 `OverlayService.isRunning`），代价很低。
   Future<void> hide() async {
-    if (!_isShowing) return;
     try {
       await overlay.FlutterScreenOverlay.closeOverlay();
     } catch (e) {
@@ -215,6 +227,39 @@ class OverlayController {
     } finally {
       _isShowing = false;
     }
+  }
+
+  /// 换一个位置显示（关窗 + 重开）
+  ///
+  /// ## 为什么必须关窗重开，而不是 moveOverlay
+  ///
+  /// 位置在 Android 侧是 `WindowManager.LayoutParams.gravity`
+  /// （插件 `showOverlay()` 的 `alignment` 参数）。而
+  /// `moveOverlay(x, y)` 只改 `params.x / params.y` —— 那是**相对当前
+  /// gravity 的偏移**，改它不会把窗口从底部挪到顶部。
+  ///
+  /// 想换 gravity，插件没暴露对应接口，只能 `closeOverlay()` + `showOverlay()`。
+  ///
+  /// ## 代价可控（实测过源码，不是猜的）
+  ///
+  /// 看起来「关窗重开」很重，但：
+  /// - `OverlayService.onDestroy()` 只做 `detachOverlayView()` 和
+  ///   `stopSelf()`，**不会**把引擎从 `FlutterEngineCache` 里移除；
+  /// - 所以下次 `showOverlay()` 拿到的还是同一个热引擎，
+  ///   **不会**触发 overlayMain 冷启动（否则要等约 5s）。
+  ///
+  /// ## 但 widget 树会重建
+  ///
+  /// `detachOverlayView()` 会 `new FlutterView(...)`，
+  /// 因此 `_OverlayScreenState` 是全新的 —— 字号、透明度、当前字幕都归零。
+  /// 这正是 `overlay_screen.dart` 被写成「无状态渲染器」的原因：
+  /// 它起来后会发 `requestSync` 向主 App 要回完整的当前状态。
+  ///
+  /// 因此本方法**只负责窗口**，不负责把设置推过去 ——
+  /// 那是 `TranslationService` 在 `requestSync` 里做的事。
+  Future<OverlayShowResult> reposition(SubtitlePosition position) async {
+    await hide();
+    return show(position: position);
   }
 
   /// 把悬浮窗错误码翻译成用户能看懂的一句话

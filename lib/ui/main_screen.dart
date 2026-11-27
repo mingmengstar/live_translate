@@ -494,7 +494,109 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           if (service.lastError != null)
             _buildStatusRow('最后错误', service.lastError!, 
                 valueColor: Colors.redAccent, isError: true),
+          const SizedBox(height: 8),
+          _buildOverlaySettingsRow(context, service),
         ],
+      ),
+    );
+  }
+
+  /// 悬浮窗显示设置（字号 / 透明度 / 位置）
+  ///
+  /// 为什么主界面也要有一份：悬浮窗上的按钮只在窗口可见时够得着。
+  /// 用户收起窗口、或窗口因权限没弹出来时，仍需能预先调好这些值。
+  /// 而且这里的改动会立刻同步到已显示的窗口上（走 shareData）。
+  Widget _buildOverlaySettingsRow(
+    BuildContext context,
+    TranslationService service,
+  ) {
+    final s = service.overlaySettings;
+    return Row(
+      children: [
+        Icon(Icons.tune_rounded, size: 15, color: Colors.grey[500]),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            '悬浮窗设置',
+            style: TextStyle(color: Colors.grey[400], fontSize: 12),
+          ),
+        ),
+        // 字号 − / 值 / 字号 +
+        _buildSettingChip(
+          icon: Icons.text_decrease_rounded,
+          tooltip: '减小悬浮窗字号',
+          onTap: s.canDecreaseFont
+              ? () => service.updateOverlaySettings(s.withSmallerFont)
+              : null,
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            s.fontSize.toStringAsFixed(0),
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+        ),
+        _buildSettingChip(
+          icon: Icons.text_increase_rounded,
+          tooltip: '增大悬浮窗字号',
+          onTap: s.canIncreaseFont
+              ? () => service.updateOverlaySettings(s.withLargerFont)
+              : null,
+        ),
+        const SizedBox(width: 6),
+        // 透明度
+        _buildSettingChip(
+          icon: Icons.opacity_rounded,
+          tooltip: '切换悬浮窗透明度（当前 ${(s.opacity * 100).round()}%）',
+          onTap: () => service.updateOverlaySettings(s.withNextOpacity),
+        ),
+        const SizedBox(width: 6),
+        // 位置
+        _buildSettingChip(
+          icon: Icons.vertical_align_top_rounded,
+          tooltip: '切换悬浮窗位置（当前：${s.position.label}）',
+          onTap: () => service.cycleOverlayPosition(),
+          label: s.position.label,
+        ),
+      ],
+    );
+  }
+
+  /// 设置区的小按钮（可带文字标签）
+  Widget _buildSettingChip({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onTap,
+    String? label,
+  }) {
+    final enabled = onTap != null;
+    final color = enabled ? Colors.grey[300] : Colors.grey[700];
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          height: 28,
+          padding: EdgeInsets.symmetric(horizontal: label == null ? 6 : 8),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 14, color: color),
+              if (label != null) ...[
+                const SizedBox(width: 4),
+                Text(
+                  label,
+                  style: TextStyle(color: color, fontSize: 11),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }
