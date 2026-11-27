@@ -47,6 +47,7 @@ import 'dart:developer';
 import 'dart:io' show Platform;
 
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
+import 'package:live_translate/core/model/model_catalog.dart' show MtPromptStyle;
 import 'package:live_translate/core/model/model_storage.dart';
 
 import 'mt_engine.dart';
@@ -147,6 +148,15 @@ class LlamaMTEngine implements MTEngine {
     repeatPenalty: 1.05,
   );
 
+  /// 提示词模板（由 config 决定，默认混元模板）
+  ///
+  /// 不同模型对指令格式极度敏感：用错模板不会报错，
+  /// 只会「原样输出」或吐出一串乱码，属于最难排查的一类问题。
+  MtPromptStyle _promptStyle = MtPromptStyle.hyMt;
+
+  /// 当前使用的提示词模板（诊断用）
+  MtPromptStyle get promptStyle => _promptStyle;
+
   // 获取器
   bool get isModelReady => _modelReady;
 
@@ -176,6 +186,14 @@ class LlamaMTEngine implements MTEngine {
   }) async {
     sourceLanguage = sourceLang;
     targetLanguage = targetLang;
+
+    // 0) 提示词模板：不同模型必须用各自的指令格式
+    final styleName = config['promptStyle'] as String?;
+    _promptStyle = switch (styleName) {
+      'chatMl' => MtPromptStyle.chatMl,
+      'hyMt' => MtPromptStyle.hyMt,
+      _ => _promptStyle,
+    };
 
     // 1) 解析权重路径（允许 config 覆盖，便于测试 / 指定其他 GGUF）
     _modelPath = (config['modelPath'] as String?) ??
@@ -296,11 +314,26 @@ class LlamaMTEngine implements MTEngine {
   ///
   /// {source}<|endoftext|>
   /// ```
+  ///
+  /// v0.6.0 起支持多种模板：Qwen2.5 等 instruct 模型用 ChatML，
+  /// 混元系列用上面的专用模板。用错模板不会报错，只会「输出原文/乱码」，
+  /// 属于最难排查的一类问题，所以模板由 [MtModelSpec] 显式指定。
   String _buildPrompt(String text, String targetLang) {
     final targetName = _languageNames[targetLang] ?? targetLang;
-    return '<|startoftext|>Translate the following segment into '
-        '$targetName, without additional explanation.\n\n'
-        '$text<|endoftext|>';
+    switch (_promptStyle) {
+      case MtPromptStyle.chatMl:
+        return '<|im_start|>system\n'
+            'You are a professional translator. Translate the user\'s text '
+            'into $targetName. Output only the translation, '
+            'without any explanation or extra text.<|im_end|>\n'
+            '<|im_start|>user\n'
+            '$text<|im_end|>\n'
+            '<|im_start|>assistant\n';
+      case MtPromptStyle.hyMt:
+        return '<|startoftext|>Translate the following segment into '
+            '$targetName, without additional explanation.\n\n'
+            '$text<|endoftext|>';
+    }
   }
 
   /// 流式翻译
@@ -538,6 +571,7 @@ class LlamaMTEngine implements MTEngine {
       'targetLanguage': targetLanguage,
       'modelPath': _modelPath,
       'error': _lastError,
+      'promptStyle': _promptStyle.name,
       'nativeLibraryExpected': isNativeLibraryExpected,
     };
   }

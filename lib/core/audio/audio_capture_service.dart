@@ -68,8 +68,51 @@ class AudioCaptureService {
   // 回调
   Function(Uint8List)? _onAudioSegment;
 
-  // 音频流订阅
+/// 音频流订阅
   StreamSubscription<dynamic>? _audioSubscription;
+
+  // ---------------------------------------------------------------------------
+  // 断流重连（v0.6.0）
+  // ---------------------------------------------------------------------------
+
+  /// 断流重连计时器
+  ///
+  /// 为什么必须有：`EventChannel` 在两种真实场景下会静默断流 ——
+  ///
+  /// 1. 用户锁屏后系统回收了 `MediaProjection`（部分厂商 ROM 会这样做），
+  ///    原生侧 `stopSelf()`，Dart 这边只收到 `onDone`；
+  /// 2. 屏幕旋转 / 切到其他 App 触发 `Activity` 重建，
+  ///    `MethodChannel` 的 handler 被重设，旧 EventSink 变成孤儿。
+  ///
+  /// 两种情况下 `_isRecording` 都还是 `true`，但**再也没有 PCM 进来**。
+  /// 旧实现只在 `onError` 里打一行日志，表现就是「界面显示运行中，
+  /// 字幕永远停在上一句」—— 用户完全无法自救，只能杀进程重开。
+  Timer? _reconnectTimer;
+
+  /// 已尝试重连次数（成功后清零）
+  int _reconnectAttempts = 0;
+
+  /// 重连退避上限（秒）
+  ///
+  /// 1s → 2s → 4s → 8s → 15s 封顶：弱网 / 边充边录时偶发断流，
+  /// 前几次快速重试能立刻恢复；如果真的是授权被撤销，
+  /// 无限快重试只会把 CPU 打满。
+  static const int _maxReconnectDelaySeconds = 15;
+
+  /// 是否正在重连（UI 可展示「重连中」）
+  bool _isReconnecting = false;
+
+  /// 最近一次重连错误（UI 可展示）
+  String? _lastReconnectError;
+
+  /// 是否正在重连
+  bool get isReconnecting => _isReconnecting;
+
+  /// 最近一次重连失败原因
+  String? get lastReconnectError => _lastReconnectError;
+
+  /// 已连续重连次数
+  int get reconnectAttempts => _reconnectAttempts;
 
   /// 是否正在录音
   bool get isRecording => _isRecording;
@@ -160,14 +203,20 @@ class AudioCaptureService {
       _vad.reset();
 
       // 3) 监听 PCM 数据流
-      _audioSubscription ??= _audioStreamChannel.receiveBroadcastStream().listen(
+      _audioSubscription?.cancel();
+      _audioSubscription = _audioStreamChannel.receiveBroadcastStream().listen(
         _onAudioDataReceived,
         onError: (Object error) {
           log('[AudioCapture] 音频流错误: $error', name: 'AudioCapture');
+          _onStreamBroken('音频流异常: $error');
         },
         onDone: () {
           log('[AudioCapture] 音频流结束', name: 'AudioCapture');
+          // 只有「本应在录但流结束了」才算异常：主动 stop() 时
+          // _isRecording 已经先被置 false，不会误触发重连。
+          _onStreamBroken('音频流已结束');
         },
+        cancelOnError: false,
       );
 
       log('[AudioCapture] 开始捕获系统音频', name: 'AudioCapture');
@@ -201,6 +250,14 @@ class AudioCaptureService {
   /// 直接转给 VAD isolate，主线程零计算。
   void _onAudioDataReceived(dynamic data) {
     if (!_isRecording || data == null) return;
+    // 收到真实数据即视为链路恢复：清掉重连计数，
+    // 否则「偶发断流 → 已重连 3 次」会一直留着，下次断流直接跳到 8s 退避。
+    if (_reconnectAttempts != 0 || _isReconnecting) {
+      _reconnectAttempts = 0;
+      _isReconnecting = false;
+      _lastReconnectError = null;
+      log('[AudioCapture] 音频链路已恢复', name: 'AudioCapture');
+    }
     final Uint8List? pcm = data is Uint8List
         ? data
         : (data is List<int> ? Uint8List.fromList(data) : null);
@@ -208,9 +265,109 @@ class AudioCaptureService {
     _vad.feed(pcm);
   }
 
+  // ---------------------------------------------------------------------------
+  // 断流重连
+  // ---------------------------------------------------------------------------
+
+  /// 音频流中断的处理入口（`onError` / `onDone` 都会走这里）
+  ///
+  /// ## 为什么要区分「主动停止」和「意外断流」
+  ///
+  /// `stop()` 里会先 `_isRecording = false` 再 `cancel()` 订阅，
+  /// 所以主动停止时走到这里 `_isRecording` 已经是 false，直接返回。
+  /// 只有「本来在录、流却没了」才需要重连。
+  ///
+  /// ## 为什么先「停干净」再重连
+  ///
+  /// 断流后原生侧的 `MediaProjection` 可能还活着但已失效。
+  /// 直接 `start()` 会命中「MediaProjection token 只能消费一次」
+  /// 的钢印级约束（见 HANDOVER 第 7 节）→ `SecurityException`。
+  /// 所以必须先 `stopCapture` 释放，再重新走完整启动流程
+  /// （重新申请授权 → startForeground → getMediaProjection）。
+  void _onStreamBroken(String reason) {
+    if (!_isRecording) return;
+    // 已经在重连队列里：不要叠加计时器，否则一次断流会排出好几次重连
+    if (_reconnectTimer?.isActive ?? false) return;
+
+    _isReconnecting = true;
+    _lastReconnectError = reason;
+    _reconnectAttempts++;
+
+    // 指数退避：1s, 2s, 4s, 8s, 15s, 15s...
+    //
+    // 注意 `clamp` 返回 `num`，不能直接做 `<<` 的左操作数（类型错误），
+    // 所以先算好指数再取位移。
+    final shift = (_reconnectAttempts - 1).clamp(0, 4);
+    final seconds = (1 << shift).clamp(1, _maxReconnectDelaySeconds);
+
+    log(
+      '[AudioCapture] $reason，${seconds}s 后尝试第 $_reconnectAttempts 次重连',
+      name: 'AudioCapture',
+    );
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(seconds: seconds), _attemptReconnect);
+  }
+
+  /// 执行一次重连
+  Future<void> _attemptReconnect() async {
+    // 期间用户可能已经手动停止
+    if (!_isRecording) {
+      _isReconnecting = false;
+      return;
+    }
+
+    try {
+      log('[AudioCapture] 正在重连音频链路...', name: 'AudioCapture');
+
+      // 1) 释放可能已失效的订阅与原生采集（吞异常：本来就已经坏了）
+      try {
+        await _audioSubscription?.cancel();
+      } catch (_) {}
+      _audioSubscription = null;
+      try {
+        await _controlChannel.invokeMethod<bool>('stopCapture');
+      } catch (_) {}
+
+      // 2) 重新走完整启动流程（含重新申请授权）
+      //
+      // 直接调 start() 会命中 `_isStarting` / `_isRecording` 的保护，
+      // 所以先把标志位放掉（start() 内部还会再置一次）。
+      _isRecording = false;
+      await start();
+
+      if (_isRecording) {
+        // 起成功了，但要看是否真的恢复：等第一个数据块回来才算数，
+        // 这里先复位「重连中」，由 _onAudioDataReceived 清计数。
+        log('[AudioCapture] 重连成功，等待音频数据确认',
+            name: 'AudioCapture');
+      } else {
+        _onStreamBroken('重连未成功恢复录制');
+      }
+    } catch (e) {
+      _lastReconnectError = '$e';
+      log('[AudioCapture] 重连失败: $e', name: 'AudioCapture');
+      // 继续排下一次（_isRecording 可能已被 start() 的 catch 置 false）
+      if (_isRecording) {
+        _isReconnecting = false;
+        _onStreamBroken('重连失败: $e');
+      }
+    }
+  }
+
   /// 停止捕获
   Future<void> stop() async {
     if (!_isRecording) return;
+
+    // 先置 false：这样 onDone / onError 回调里的 _onStreamBroken 会直接返回，
+    // 不会把「用户主动停止」误判成「断流」去重连。
+    _isRecording = false;
+
+    // 取消待执行的重连
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _isReconnecting = false;
+    _reconnectAttempts = 0;
 
     try {
       await _audioSubscription?.cancel();
@@ -221,8 +378,6 @@ class AudioCaptureService {
       // 吐出缓冲区中残留的语音段（避免丢掉用户最后一句）
       _vad.flush();
 
-      _isRecording = false;
-
       log('[AudioCapture] 停止捕获', name: 'AudioCapture');
     } catch (e, stack) {
       log('[AudioCapture] 停止失败: $e\n$stack', name: 'AudioCapture');
@@ -232,6 +387,11 @@ class AudioCaptureService {
   /// 释放资源（钢印级：必须彻底释放）
   Future<void> dispose() async {
     await stop();
+    // 保险：即使 stop() 因为 _isRecording 已为 false 提前 return，
+    // 也要保证重连计时器不会在 dispose 之后还把服务拉起来。
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _isReconnecting = false;
     await _vad.dispose();
     _onAudioSegment = null;
   }

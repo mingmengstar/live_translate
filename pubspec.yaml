@@ -47,13 +47,17 @@ dependencies:
   permission_handler: ^11.3.1
   path_provider: ^2.1.2
   shared_preferences: ^2.2.2
-  # 模型下载后的 SHA-256 完整性校验
-  #
+  
+  # 注：`crypto` 已在 v0.6.0 移除。
+  # 旧实现用它做模型下载后的 SHA-256 完整性校验，但 1GB 级模型在手机上
+  # 算一次要几十秒，且镜像 / 代理一旦改写字节就会陷入「下完 → 校验失败 →
+  # 重下」的死循环。现在只判「写入字节数 == 服务端声明字节数」
+  # （能挡住截断），真正的损坏会在 llama.cpp / sherpa-onnx 加载时报错。
+  
   # 注：曾经预留过 file_picker（想用 SAF 选目录），但最终「自定义模型目录」
   # 走的是「手输绝对路径」方案，lib/ 里从未 import 它。
   # 它自带 Android 原生 AAR，在 AGP 9.3.1 下有 AAR 元数据冲突风险，
   # 属于「零收益 + 高 CI 风险」，故移除。将来真需要 SAF 再加回。
-  crypto: ^3.0.6
 
 dev_dependencies:
   flutter_test:

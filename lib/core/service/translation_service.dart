@@ -9,10 +9,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart';
 import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/audio/audio_capture_service.dart';
+import 'package:live_translate/core/model/model_catalog.dart';
 import 'package:live_translate/core/model/model_storage.dart';
 import 'package:live_translate/core/overlay/overlay_controller.dart';
 import 'package:live_translate/core/overlay/overlay_protocol.dart';
 import 'package:live_translate/core/overlay/overlay_settings.dart';
+import 'package:live_translate/core/service/app_settings.dart';
 
 class TranslationService extends ChangeNotifier {
   final EngineManager _engineManager = EngineManager();
@@ -41,6 +43,12 @@ class TranslationService extends ChangeNotifier {
   String _asrLanguage = 'en';
   String _mtSourceLang = 'en';
   String _mtTargetLang = 'ja';
+
+  /// 当前选用的翻译模型（决定提示词模板与内存需求）
+  MtModelVariant _mtModelVariant = MtModelVariant.hyMt15Q4;
+
+  /// 当前选用的翻译模型
+  MtModelVariant get mtModelVariant => _mtModelVariant;
   
   // VAD 后端说明（初始化时写入，UI 可展示「当前用的是 Silero 还是能量 VAD」）
   String? _vadBackendNote;
@@ -100,6 +108,253 @@ class TranslationService extends ChangeNotifier {
   /// 引擎选择说明（为何当前是 Mock / 真实引擎，如「模型缺失（2/6），使用 Mock 引擎」）
   String? get engineNote => _engineNote;
   
+  /// 重新加载引擎（模型下载完成后热切换用）
+  ///
+  /// ## 为什么需要它
+  ///
+  /// 模型下载是「运行中」发生的：用户可能在服务已启动、甚至正在看着
+  /// 「未加载」状态时去下载模型。下完之后如果只能重启 App 才生效，
+  /// 用户会以为「下载了但没用」。
+  ///
+  /// ## 与 [initialize] 的区别
+  ///
+  /// - `initialize()` 是**冷启动**：注册工厂 + 选引擎 + 初始化音频/VAD/悬浮窗。
+  ///   重复调用会重复 `_engineManager.addListener`（监听器越加越多）。
+  /// - `reloadEngines()` 是**热重载**：只做「释放旧引擎 → 重新注册 → 重新选」，
+  ///   不动音频捕获、不动悬浮窗、不重复订阅。
+  ///
+  /// 返回本次是否成功切到了真实引擎（false 表示仍然缺模型 / 加载失败，
+  /// 具体原因见 [engineNote]）。
+  ///
+  /// 若服务正在运行，会在重载前后自动「停 → 起」，否则旧引擎的 isolate
+  /// 已被释放、新引擎还没 start，音频会直接丢进一个不存在的引擎。
+  Future<bool> reloadEngines() async {
+    final wasRunning = _isServiceRunning;
+
+    _updateStatus('正在重新加载引擎...');
+
+    // 停：必须在 disposeAll 之前。否则 dispose 掉的是正在吐结果的实例。
+    if (wasRunning) {
+      try {
+        await stopService();
+      } catch (e) {
+        log('[TranslationService] 重载前停止服务失败: $e',
+            name: 'TranslationService');
+      }
+    }
+
+    // 释放：先停 ASR 再释放，避免 isolate 还在往已销毁的端口发消息
+    await _engineManager.disposeAll();
+
+    // 重新注册（disposeAll 只清实例，工厂表其实还在，这里显式重注册
+    // 保证「从没 initialize 过」的路径也能用）
+    _engineManager.registerASREngine(
+      SherpaASREngine.kEngineId,
+      () => SherpaASREngine(),
+    );
+    _engineManager.registerMTEngine(
+      LlamaMTEngine.kEngineId,
+      () => LlamaMTEngine(),
+    );
+
+    // 重新判定模型是否齐全
+    String? engineNote;
+    var modelsReady = false;
+    try {
+      final status = await ModelStorage.instance.inspect();
+      if (status.hasError) {
+        engineNote = '模型检测失败：${status.error}';
+      } else if (status.isReady) {
+        modelsReady = true;
+        engineNote = '模型齐全，正在加载真实引擎';
+      } else {
+        engineNote = '模型缺失（${status.presentCount}/${status.totalCount}），'
+            '请先到「模型管理」下载';
+      }
+    } catch (e) {
+      engineNote = '模型检测异常：$e';
+      log('[TranslationService] 重载时模型检测失败: $e',
+          name: 'TranslationService');
+    }
+
+    if (!modelsReady) {
+      _engineNote = engineNote;
+      _updateStatus('等待模型');
+      _lastError = null;
+      notifyListeners();
+      return false;
+    }
+
+    var asrOk = false;
+    var mtOk = false;
+
+    asrOk = await _engineManager.switchASREngine(
+      engineId: SherpaASREngine.kEngineId,
+      config: {'language': _asrLanguage},
+    );
+    if (!asrOk) {
+      final reason = _summarizeReason(_engineManager.lastASRError);
+      engineNote = '真实 ASR 加载失败${reason == null ? '' : '（$reason）'}';
+    }
+
+    mtOk = await _engineManager.switchMTEngine(
+      engineId: LlamaMTEngine.kEngineId,
+      config: {
+        'sourceLang': _mtSourceLang,
+        'targetLang': _mtTargetLang,
+        'promptStyle': _currentMtPromptStyleName,
+      },
+    );
+    if (!mtOk) {
+      final reason = _summarizeReason(_engineManager.lastMTError);
+      engineNote = '真实 MT 加载失败${reason == null ? '' : '（$reason）'}';
+    }
+
+    _engineNote = engineNote;
+
+    // VAD 模型可能是这次刚下的：重新解析一次路径
+    try {
+      final vadPath = await ModelStorage.instance.resolveVadModelPath();
+      _vadBackendNote = vadPath == null
+          ? '未提供 Silero 模型，使用能量 VAD'
+          : 'Silero VAD 可用';
+      await _audioCapture.initialize(
+        sileroModelPath: vadPath,
+        onAudioSegment: _onAudioSegment,
+      );
+    } catch (e) {
+      log('[TranslationService] 重载 VAD 失败: $e', name: 'TranslationService');
+    }
+
+    final ok = asrOk && mtOk;
+    if (ok) {
+      _updateStatus('引擎就绪（真实引擎）');
+      _lastError = null;
+    } else {
+      _lastError = engineNote;
+      _updateStatus('初始化失败');
+    }
+    notifyListeners();
+
+    // 起：只有在原来就在跑、且这次重载成功时才恢复
+    if (wasRunning && ok) {
+      try {
+        await startService();
+      } catch (e) {
+        log('[TranslationService] 重载后重启服务失败: $e',
+            name: 'TranslationService');
+      }
+    }
+
+    return ok;
+  }
+
+  /// 当前 MT 提示词模板（供 reloadEngines 传给引擎）
+  String get _currentMtPromptStyleName =>
+      ModelCatalog.mtSpec(_mtModelVariant).promptStyle.name;
+
+  // ---------------------------------------------------------------------------
+  // 引擎健康检查（v0.6.0）
+  // ---------------------------------------------------------------------------
+
+  /// 健康检查计时器
+  Timer? _healthCheckTimer;
+
+  /// 健康检查周期
+  ///
+  /// 30s：够快发现「引擎静默死了」，又不会让 `getStatus()` 频繁打断推理。
+  /// 检查本身只是读字段，但真实引擎的 `getStatus()` 会走 FFI 查询，
+  /// 太频繁会拖慢 decode。
+  static const Duration healthCheckInterval = Duration(seconds: 30);
+
+  /// 连续多少次健康检查失败后触发重载
+  ///
+  /// 不用「一次失败就重载」：切引擎 / 刚 start 的瞬间状态本来就是中间态，
+  /// 一次误判会把正在正常运行的引擎打断。连续 2 次（约 1 分钟）
+  /// 才是真的死了。
+  static const int healthFailureThreshold = 2;
+
+  int _consecutiveHealthFailures = 0;
+
+  /// 连续失败次数（诊断用）
+  int get consecutiveHealthFailures => _consecutiveHealthFailures;
+
+  /// 最近一次健康检查的结论说明（UI 可展示）
+  String? _healthNote;
+  String? get healthNote => _healthNote;
+
+  /// 启动周期性健康检查
+  ///
+  /// 检查内容（任一不满足即计一次失败）：
+  /// - 服务在跑，但 ASR 引擎的 `isRunning` 是 false（说明 isolate 已经死了）；
+  /// - 服务在跑，但 MT 引擎 `isInitialized` 是 false。
+  ///
+  /// 达到 [healthFailureThreshold] 次失败后自动调 [reloadEngines]。
+  /// 重载本身失败也不会无限循环：重载会把计数清零，
+  /// 若模型真的没了，`reloadEngines` 会返回 false 并保持「等待模型」状态。
+  void startHealthCheck() {
+    _healthCheckTimer?.cancel();
+    _healthCheckTimer = Timer.periodic(healthCheckInterval, (_) {
+      // 未 await：定时器回调不能是 async，且检查本身不抛异常
+      unawaited(runHealthCheckOnce());
+    });
+  }
+
+  /// 停止周期性健康检查
+  void stopHealthCheck() {
+    _healthCheckTimer?.cancel();
+    _healthCheckTimer = null;
+  }
+
+  /// 执行一次健康检查（可被测试直接调用）
+  Future<bool> runHealthCheckOnce() async {
+    if (!_isServiceRunning) {
+      _consecutiveHealthFailures = 0;
+      return true;
+    }
+
+    final asr = _engineManager.currentASR;
+    final mt = _engineManager.currentMT;
+
+    // 没有引擎：说明本来就处于「等待模型」，不是健康问题
+    if (asr == null && mt == null) {
+      _consecutiveHealthFailures = 0;
+      return true;
+    }
+
+    String? problem;
+    if (asr != null && !asr.isRunning) {
+      problem = 'ASR 引擎已停止响应';
+    } else if (asr != null && !asr.isInitialized) {
+      problem = 'ASR 引擎未初始化';
+    } else if (mt != null && !mt.isInitialized) {
+      problem = 'MT 引擎未初始化';
+    }
+
+    if (problem == null) {
+      _consecutiveHealthFailures = 0;
+      _healthNote = null;
+      return true;
+    }
+
+    _consecutiveHealthFailures++;
+    _healthNote = '$problem（连续 $_consecutiveHealthFailures 次）';
+    log(
+      '[TranslationService] 健康检查失败: $_healthNote',
+      name: 'TranslationService',
+    );
+    notifyListeners();
+
+    if (_consecutiveHealthFailures >= healthFailureThreshold) {
+      _consecutiveHealthFailures = 0;
+      log('[TranslationService] 连续失败达阈值，自动重载引擎',
+          name: 'TranslationService');
+      unawaited(reloadEngines());
+      return false;
+    }
+    return false;
+  }
+
   /// 初始化服务：注册真实引擎、初始化音频捕获
   ///
   /// ## v0.5.0：为什么不再注册 / 不自动降级到 Mock
@@ -122,6 +377,16 @@ class TranslationService extends ChangeNotifier {
   /// release 构建会把它们 tree-shake 掉。
   Future<void> initialize() async {
     _updateStatus('正在初始化引擎...');
+
+    // 0) 恢复持久化的语言 / 模型选择
+    //
+    // 必须在选引擎**之前**：`switchASREngine` 要拿 `_asrLanguage` 当参数，
+    // 晚一步就会出现「界面显示 en→zh，实际引擎按 en→ja 跑」的错位。
+    await AppSettingsStore.instance.load();
+    _asrLanguage = AppSettingsStore.instance.asrLanguage;
+    _mtSourceLang = AppSettingsStore.instance.mtSourceLang;
+    _mtTargetLang = AppSettingsStore.instance.mtTargetLang;
+    _mtModelVariant = AppSettingsStore.instance.mtVariant;
 
     // 注册真实引擎（需要模型文件；initialize 失败会被 EngineManager 捕获）
     _engineManager.registerASREngine(
@@ -177,6 +442,7 @@ class TranslationService extends ChangeNotifier {
         config: {
           'sourceLang': _mtSourceLang,
           'targetLang': _mtTargetLang,
+          'promptStyle': _currentMtPromptStyleName,
         },
       );
       if (!mtOk) {
@@ -502,6 +768,9 @@ class TranslationService extends ChangeNotifier {
       await _syncOverlayWithServiceState();
 
       _updateStatus('服务运行中...');
+      // 服务真正跑起来后才开始体检：start 之前引擎还没 start，
+      // 立刻检查必然「未响应」，会白白消耗一次失败配额。
+      startHealthCheck();
       notifyListeners();
     } catch (e, stack) {
       _lastError = '启动失败: $e';
@@ -575,6 +844,10 @@ class TranslationService extends ChangeNotifier {
     if (!_isServiceRunning) return;
     
     _updateStatus('正在停止服务...');
+    
+    // 先停体检：stop 过程中引擎会一个个置空，
+    // 体检会把这些中间态判成「挂了」并触发一次多余的重载。
+    stopHealthCheck();
     
     try {
       // 先关悬浮窗：停止过程中引擎会清空字幕，
@@ -749,17 +1022,38 @@ class TranslationService extends ChangeNotifier {
   }
   
   /// 切换 ASR 语言
+  ///
+  /// v0.6.0 起会持久化：App 重启后仍是上次选的语言。
+  /// 落盘失败不影响本次运行（`saveLanguages` 内部已吞异常）。
   Future<void> setASRLanguage(String language) async {
     _asrLanguage = language;
+    await AppSettingsStore.instance.saveLanguages(asrLanguage: language);
     await _engineManager.switchASRLanguage(language);
     notifyListeners();
   }
-  
+
   /// 切换 MT 语言对
+  ///
+  /// v0.6.0 起会持久化：App 重启后仍是上次选的语向。
   Future<void> setMTLanguagePair(String sourceLang, String targetLang) async {
     _mtSourceLang = sourceLang;
     _mtTargetLang = targetLang;
+    await AppSettingsStore.instance.saveLanguages(
+      mtSourceLang: sourceLang,
+      mtTargetLang: targetLang,
+    );
     await _engineManager.switchMTLanguagePair(sourceLang, targetLang);
+    notifyListeners();
+  }
+
+  /// 切换翻译模型（决定提示词模板 / 内存需求）
+  ///
+  /// 只记录选择并落盘，真正的重新加载由调用方决定
+  /// （下载页在下载完成后调 [reloadEngines]）。
+  Future<void> setMtModelVariant(MtModelVariant variant) async {
+    if (_mtModelVariant == variant) return;
+    _mtModelVariant = variant;
+    await AppSettingsStore.instance.saveModelChoice(mtVariant: variant);
     notifyListeners();
   }
   
@@ -806,6 +1100,8 @@ class TranslationService extends ChangeNotifier {
   @override
   void dispose() {
     _debounceTimer?.cancel();
+    _healthCheckTimer?.cancel();
+    _healthCheckTimer = null;
     _overlayCommandSub?.cancel();
     _engineManager.removeListener(_onEngineChanged);
     // 先同步关窗（不 await，dispose 是同步的），

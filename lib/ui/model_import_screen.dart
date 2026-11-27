@@ -12,10 +12,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 
 import 'package:live_translate/core/model/model_catalog.dart';
 import 'package:live_translate/core/model/model_loader.dart';
 import 'package:live_translate/core/model/model_storage.dart';
+import 'package:live_translate/core/service/app_settings.dart';
+import 'package:live_translate/core/service/translation_service.dart';
 
 class ModelImportScreen extends StatefulWidget {
   const ModelImportScreen({super.key});
@@ -30,6 +33,9 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
 
   /// 当前选择的识别模型语种
   AsrModelVariant _variant = AsrModelVariant.zhEn;
+
+  /// 当前选择的翻译模型
+  MtModelVariant _mtVariant = MtModelVariant.hyMt15Q4;
 
   /// 是否附带翻译模型
   bool _withTranslation = true;
@@ -51,7 +57,24 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
   @override
   void initState() {
     super.initState();
+    // 恢复上次选择的模型组合（幂等，失败保持默认值）
+    _restoreSelection();
     _refresh();
+  }
+
+  /// 从持久化恢复「上次选了哪个语种 / 哪个翻译模型 / 要不要 VAD」
+  ///
+  /// 不恢复的话，用户每次进来都得从默认值重新选一遍 ——
+  /// 而下载 4.3GB 的 7B 模型显然不是「随手点一下」的操作。
+  Future<void> _restoreSelection() async {
+    final store = AppSettingsStore.instance;
+    await store.load();
+    if (!mounted) return;
+    setState(() {
+      _variant = store.asrVariant;
+      _mtVariant = store.mtVariant;
+      _withVad = store.withVad;
+    });
   }
 
   @override
@@ -257,6 +280,7 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
 
     final pack = ModelCatalog.pack(
       variant: _variant,
+      mtVariant: _mtVariant,
       withTranslation: _withTranslation,
       withVad: _withVad,
     );
@@ -285,7 +309,7 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              '下载完成后会逐个校验 SHA-256，校验不过的文件会自动丢弃重下。'
+              '下载完成后会比对文件大小做完整性检查。'
               '中途取消可保留已下载部分，下次继续。',
               style: TextStyle(color: Colors.grey[600], fontSize: 11, height: 1.6),
             ),
@@ -305,6 +329,13 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
     );
 
     if (confirmed != true || !mounted) return;
+
+    // 记住这次选的组合：下次进来还是它，不用重新点
+    unawaited(AppSettingsStore.instance.saveModelChoice(
+      asrVariant: _variant,
+      mtVariant: _mtVariant,
+      withVad: _withVad,
+    ));
 
     final loader = ModelLoader();
     _loader = loader;
@@ -347,17 +378,65 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
                   ),
                 ),
               );
-            } else {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('模型下载完成，已切换到真实引擎')),
-              );
+              return;
             }
+
+            // ---- v0.6.0：真正执行「热切换到真实引擎」 ----
+            //
+            // 旧实现只弹一句「已切换到真实引擎」，实际什么也没做 ——
+            // 用户必须杀进程重开才能用上刚下的模型。
+            // 现在调 TranslationService.reloadEngines()：内部
+            // disposeAll → 重新注册 → 重新 switch，全程不重启 App。
+            await _reloadEnginesAfterDownload();
           },
         );
   }
 
   void _cancelDownload() {
     _loader?.cancel();
+  }
+
+  /// 下载完成后把引擎热切换成刚下好的真实引擎
+  ///
+  /// ## 为什么不能只弹提示
+  ///
+  /// 下载完成时 `TranslationService` 里很可能还是「未加载」状态
+  /// （用户在下载前就打开过 App）。只弹一句「已切换到真实引擎」而不做事，
+  /// 用户回到主界面依然看到「未加载」，会以为下载白做了。
+  ///
+  /// ## 失败也要说清楚
+  ///
+  /// 常见失败：
+  /// - `armeabi-v7a` / `x86_64` 的 APK 里没有 llama.cpp 原生库 → MT 加载必失败；
+  /// - 下载的是「只识别」包 → 没有 MT 权重。
+  ///
+  /// 这两种情况下 `reloadEngines()` 返回 false，但 `engineNote` 里
+  /// 有具体原因，直接展示给用户，不要糊一句「切换失败」。
+  Future<void> _reloadEnginesAfterDownload() async {
+    // 本页是从 HomeScreen push 上来的，Provider 在祖先上，
+    // 用 `read` 取实例（`watch` 会在这里造成无谓重建）。
+    final service = context.read<TranslationService>();
+    try {
+      final ok = await service.reloadEngines();
+      if (!mounted) return;
+
+      final note = service.engineNote;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            ok
+                ? '模型下载完成，已切换到真实引擎'
+                : '模型已下载，但引擎未能加载：${note ?? '原因未知'}',
+          ),
+          duration: Duration(seconds: ok ? 4 : 8),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('模型已下载，但切换引擎失败：$e')),
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -513,6 +592,7 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
   Widget _buildDownloadCard() {
     final pack = ModelCatalog.pack(
       variant: _variant,
+      mtVariant: _mtVariant,
       withTranslation: _withTranslation,
       withVad: _withVad,
     );
@@ -622,15 +702,58 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
                 ? null
                 : (v) => setState(() => _withTranslation = v),
             title: Text(
-              '翻译模型（Hy-MT1.5 1.8B）',
+              '翻译模型（${ModelCatalog.mtSpec(_mtVariant).label}）',
               style: TextStyle(color: Colors.grey[300], fontSize: 12),
             ),
             subtitle: Text(
-              '约 1.06GB。不装则只能看到原文，无法翻译。',
+              '${ModelCatalog.mtSpec(_mtVariant).description}'
+              '不装则只能看到原文，无法翻译。',
               style: TextStyle(color: Colors.grey[600], fontSize: 10, height: 1.5),
             ),
             activeThumbColor: Colors.blue,
           ),
+
+          // 翻译模型选择：不同模型的体积/质量/内存需求差 10 倍，
+          // 必须让用户自己选，不能写死一个。
+          if (_withTranslation) ...[
+            const SizedBox(height: 4),
+            Text(
+              '翻译模型',
+              style: TextStyle(color: Colors.grey[400], fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: MtModelVariant.values.map((v) {
+                final selected = v == _mtVariant;
+                final spec = ModelCatalog.mtSpec(v);
+                return ChoiceChip(
+                  label: Text(
+                    spec.label,
+                    style: TextStyle(
+                      color: selected ? Colors.white : Colors.grey[300],
+                      fontSize: 11,
+                    ),
+                  ),
+                  selected: selected,
+                  onSelected: _downloading
+                      ? null
+                      : (_) => setState(() => _mtVariant = v),
+                  selectedColor: Colors.purple.withValues(alpha: 0.35),
+                  backgroundColor: const Color(0xFF2A2A2A),
+                  side: BorderSide(
+                    color: selected ? Colors.purpleAccent : Colors.white10,
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              ModelCatalog.mtSpec(_mtVariant).description,
+              style: TextStyle(color: Colors.grey[600], fontSize: 10, height: 1.5),
+            ),
+          ],
 
           const SizedBox(height: 8),
 

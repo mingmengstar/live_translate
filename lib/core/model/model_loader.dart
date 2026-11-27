@@ -3,7 +3,7 @@
 /// 能力：
 /// - 逐文件顺序下载，实时回报**字节级**总进度（不是假进度条）
 /// - **断点续传**：用 HTTP Range 从 `.part` 的已有长度继续，不重下
-/// - **SHA-256 校验**：比对清单里的真实哈希；不通过就删掉坏文件并重试
+/// - **完整性判定**：只比对「实际写入字节数 == 服务端声明字节数」
 /// - **磁盘空间预检**：空间不足在下载前就报错，不浪费流量
 /// - **可取消**：取消后保留 `.part`，下次同一文件自动续传
 /// - 依赖可注入（`HttpClient` / 目录），便于单元测试
@@ -22,13 +22,21 @@
 /// 所以改用 `StreamController`：`_downloadOne` 的 `onProgress` 可以
 /// 直接往 controller 里 `add`。同时用 [_ProgressThrottle] 做 200ms 节流，
 /// 避免高速网络下每 20KB 一次快照把主 isolate 的 build 打爆。
+///
+/// ## v0.6.0：移除 SHA-256 校验（勿回退）
+///
+/// 旧实现每下完一个文件都要 `sha256.bind(file.openRead())` 全量算一遍。
+/// 1.06GB 的翻译权重在手机上算一次要几十秒，界面表现为「进度 100% 后
+/// 卡住不动」；更糟的是只要镜像 / 代理改写了字节，就会
+/// 「下完 → 校验失败 → 删掉重下」，永远下不完。
+///
+/// 现在只判 `written == file.sizeBytes`。这已经能挡住截断
+/// （网络中断时 `written` 必然对不上），而真正的模型损坏会在
+/// `llama.cpp` / `sherpa-onnx` 加载阶段立刻报错。
 library live_translate.core.model.model_loader;
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-
-import 'package:crypto/crypto.dart';
 
 import 'model_catalog.dart';
 import 'model_storage.dart';
@@ -220,7 +228,6 @@ class ModelLoader {
     ModelStorage? storage,
     HttpClient? httpClient,
     this.maxRetries = 2,
-    this.verifyDigest = true,
   })  : _storage = storage ?? ModelStorage.instance,
         _ownsHttpClient = httpClient == null,
         _httpClient = httpClient ?? _createClient();
@@ -241,9 +248,6 @@ class ModelLoader {
 
   /// 单个文件的重试次数（不含首次）
   final int maxRetries;
-
-  /// 是否做 SHA-256 校验（单元测试可关掉，避免为假数据造哈希）
-  final bool verifyDigest;
 
   bool _cancelled = false;
 
@@ -392,24 +396,25 @@ class ModelLoader {
       final target =
           File('${dir.path}${Platform.pathSeparator}${file.fileName}');
 
-      // ---- 已存在且大小一致：哈希校验通过就跳过 ----
+      // ---- 已存在且大小一致：直接跳过 ----
+      //
+      // v0.6.0 起不做 SHA-256 全量校验（原因见文件头）。
+      // 大小一致即视为完整：下载时 `.part` 只有在字节数达标后才改名，
+      // 所以正式文件的大小就是完整性凭证。
       if (await target.exists() && await target.length() == file.sizeBytes) {
-        if (!verifyDigest || await _verify(target, file.sha256)) {
-          results.add(ModelFileResult(
-            file: file,
-            state: ModelFileState.skipped,
-            bytesForFile: file.sizeBytes,
-          ));
-          push(
-            results: results,
-            current: file.fileName,
-            index: index,
-            finished: false,
-            force: true,
-          );
-          continue;
-        }
-        await _safeDelete(target);
+        results.add(ModelFileResult(
+          file: file,
+          state: ModelFileState.skipped,
+          bytesForFile: file.sizeBytes,
+        ));
+        push(
+          results: results,
+          current: file.fileName,
+          index: index,
+          finished: false,
+          force: true,
+        );
+        continue;
       }
 
       final result = ModelFileResult(
@@ -455,11 +460,8 @@ class ModelLoader {
             },
           );
 
-          if (verifyDigest && !await _verify(target, file.sha256)) {
-            await _safeDelete(target);
-            throw ModelDownloadException('SHA-256 校验未通过，已丢弃重下');
-          }
-
+          // `_downloadOne` 内部已经用 `written != file.sizeBytes` 判过
+          // 完整性（见 v0.6.0 说明），这里不再做二次校验。
           result.state = ModelFileState.done;
           result.bytesForFile = file.sizeBytes;
           ok = true;
@@ -689,16 +691,6 @@ class ModelLoader {
     }
   }
 
-  Future<bool> _verify(File file, String expected) async {
-    if (expected.isEmpty) return true;
-    try {
-      final digest = await sha256.bind(file.openRead()).first;
-      return digest.toString().toLowerCase() == expected.toLowerCase();
-    } catch (_) {
-      return false;
-    }
-  }
-
   Future<void> _safeDelete(File file) async {
     try {
       if (await file.exists()) await file.delete();
@@ -706,8 +698,4 @@ class ModelLoader {
       // 忽略
     }
   }
-
-  /// 计算文本的 SHA-256（测试用）
-  static String digestOf(String text) =>
-      sha256.convert(utf8.encode(text)).toString();
 }
