@@ -75,6 +75,31 @@ REQUIRED = [
 # 入口点符号表里。实测 v0.3.4 完全没有这个符号，v0.3.5 有了。
 ENTRYPOINT_SYMBOL = "overlayMain"
 
+# 负对照：这些**不应该**出现在快照里。
+#
+# 它们都是历史上被删掉的假实现/死代码的符号。如果又出现，说明有人
+# 把它们恢复回来了（比如把「点了没反应」的占位 handler 加回去装样子）。
+#
+# ⚠️ 必须带边界匹配，不能用裸子串 —— 这里踩过一次坑：
+# Flutter 框架自身有 `_updateOpacity`（在
+# `_CupertinoTextSelectionToolbarShape` 里）和 `_updatePosition`
+# （在 `SelectionRect` 附近）。用裸 `updateOpacity` 去搜会命中框架符号，
+# 误报成「死代码被恢复了」。这跟前面 utf-16le 的假阴性一样，
+# 都是「验证方法本身出错」，比 bug 更浪费时间。
+#
+# 规则：命中位置的前一个字节不能是标识符字符。
+FORBIDDEN = [
+    ("updateFontSize", "已删除的 OverlayFlutterEngine 占位 handler"),
+    ("updateOpacity", "已删除的 OverlayFlutterEngine 占位 handler"),
+    ("updatePosition", "已删除的 OverlayFlutterEngine 占位 handler"),
+    ("OverlayFlutterEngine", "已删除的死代码 Service"),
+    ("live_translate/overlay", "已删除的死通道"),
+]
+
+_IDENT = set(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$"
+)
+
 # 对照组：这些必须存在，用于证明「文件选对了、搜索逻辑没坏」。
 # 若对照组缺失，本脚本的结论不可信，应报 INCONCLUSIVE 而不是 FAIL。
 CONTROL = [
@@ -114,6 +139,23 @@ def probe(blob: bytes, text: str) -> tuple[bool, str]:
         # 含非 ASCII 字符，不可能以 latin-1 单字节形式存在
         pass
     return False, ""
+
+
+def find_token(blob: bytes, text: str) -> int:
+    """查找一个「完整标识符」，返回首次命中位置（-1 表示没有）。
+
+    和 `probe()` 的区别：这里要求命中位置的**前一个字节不是标识符字符**。
+    例如搜 `updateOpacity` 时不能命中 Flutter 框架的 `_updateOpacity`。
+    """
+    needle = text.encode("latin-1")
+    start = 0
+    while True:
+        i = blob.find(needle, start)
+        if i == -1:
+            return -1
+        if i == 0 or blob[i - 1] not in _IDENT:
+            return i
+        start = i + 1
 
 
 def main() -> int:
@@ -175,6 +217,27 @@ def main() -> int:
         print("RESULT=FAIL")
         return 1
 
+    # 负对照：确认死代码没有被偷偷恢复
+    print("=== 负对照（已删除的假实现不得回归）===")
+    resurrected = []
+    for symbol, what in FORBIDDEN:
+        pos = find_token(blob, symbol)
+        if pos == -1:
+            print(f"  [OK      ] {symbol!r:24} <- {what}")
+        else:
+            print(f"  [HIT!    ] {symbol!r:24} <- {what}")
+            resurrected.append(symbol)
+
+    if resurrected:
+        print(
+            f"\nFAIL: {len(resurrected)} 个已删除的符号又出现了：{resurrected}\n"
+            "      这些 handler 当年全是 result.success(true) 占位、"
+            "点了没反应，不要恢复。"
+        )
+        print("RESULT=FAIL")
+        return 1
+
+    print()
     print("PASS: overlay_screen.dart 已完整进入 libapp.so，overlayMain 可被运行时解析")
     print("RESULT=PASS")
     return 0
