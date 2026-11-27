@@ -296,7 +296,7 @@ class _HomeScreenState extends State<HomeScreen> {
       accent = Colors.orangeAccent;
       stateText = '缺失';
       detail = '已检测 ${status.presentCount}/${status.totalCount} 个文件，'
-          '当前使用 Mock 引擎';
+          '请到「模型管理」下载后才能开始翻译';
       icon = Icons.warning_amber_rounded;
     }
 
@@ -353,12 +353,18 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// 引擎状态卡片
+  ///
+  /// ## v0.5.0：不再有「Mock 模式」这个状态
+  ///
+  /// 现在只有两种真实状态：**已加载** / **未加载**。
+  /// 「未加载」一定是模型没下好，正文里会说明缺什么，
+  /// 而不是含糊地说「Mock 模式」让人以为功能正常。
   Widget _buildEngineCard(TranslationService service) {
     final manager = service.engineManager;
     final asrId = manager.currentASRId;
     final mtId = manager.currentMTId;
-    final isMock = (asrId?.startsWith('mock') ?? true) &&
-        (mtId?.startsWith('mock') ?? true);
+    // 两个都加载成功才算「就绪」：任一为 null 都说明模型不完整。
+    final bothLoaded = asrId != null && mtId != null;
 
     return _buildCard(
       title: '引擎状态',
@@ -366,14 +372,14 @@ class _HomeScreenState extends State<HomeScreen> {
       trailing: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
-          color: (isMock ? Colors.orangeAccent : Colors.greenAccent)
+          color: (bothLoaded ? Colors.greenAccent : Colors.orangeAccent)
               .withValues(alpha: 0.15),
           borderRadius: BorderRadius.circular(8),
         ),
         child: Text(
-          isMock ? 'Mock 模式' : '真实引擎',
+          bothLoaded ? '已加载' : '未加载',
           style: TextStyle(
-            color: isMock ? Colors.orangeAccent : Colors.greenAccent,
+            color: bothLoaded ? Colors.greenAccent : Colors.orangeAccent,
             fontSize: 11,
             fontWeight: FontWeight.w600,
           ),
@@ -389,7 +395,7 @@ class _HomeScreenState extends State<HomeScreen> {
           // 这里显式暴露，避免用户困惑「为什么下载了模型切分还不准」。
           _buildInfoRow('VAD 后端', service.vadBackendNote ?? '未初始化'),
           const SizedBox(height: 10),
-          // 引擎说明：模型缺失 / 加载失败时会说明为何仍是 Mock
+          // 引擎说明：模型缺失 / 加载失败时会说明具体原因
           _buildInfoRow('引擎说明', service.engineNote ?? '未初始化'),
           const SizedBox(height: 10),
           _buildInfoRow(

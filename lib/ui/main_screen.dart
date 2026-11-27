@@ -786,6 +786,16 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   /// 这里的选项是「用哪套实现来做识别 / 翻译」，
   /// 与上面的语言设置是两件事：语言决定「听什么、译成什么」，
   /// 引擎决定「用谁来做」。
+  ///
+  /// ## v0.5.0：Mock 已从选择器中移除
+  ///
+  /// 现在只有真实引擎两个选项。原因：
+  /// - Mock 只产出预置假文本，切过去之后字幕条「有内容」但完全不反映真实音频，
+  ///   比不显示更有害（用户会以为是识别不准，而不是「根本没在识别」）；
+  /// - 引擎注册表里已经没有 `mock_asr` / `mock_mt`（见
+  ///   `TranslationService.initialize`），即使列出来也切不过去。
+  ///
+  /// 模型没下载时这里会显示「未加载」，配合上面的 `engineNote` 说明原因。
   Widget _buildEngineCard(BuildContext context, TranslationService service) {
     return _buildCard(
       title: '引擎选择',
@@ -794,20 +804,18 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildSectionHint(
-            '决定「由谁来完成识别和翻译」。'
-            'Mock 引擎只产生示例文本，用于在没有模型时验证整条链路；'
-            '真实引擎需要先导入或下载模型才能启用。',
+            '决定「由谁来完成识别和翻译」。两个都是端侧离线引擎，'
+            '需要先在「模型管理」里下载对应的模型文件才能启用。',
           ),
           const SizedBox(height: 16),
 
           // ASR 引擎选择
           _buildEngineSelector(
             label: 'ASR 引擎',
-            hint: '把声音转成文字的组件。Mock 为演示实现，真实引擎为本地离线识别。',
+            hint: '把声音转成文字的组件。模型未就绪时显示「未加载」。',
             currentEngine: service.engineManager.currentASRId,
             availableEngines: service.engineManager.getRegisteredASREngines(),
             engineDisplayNames: const {
-              'mock_asr': 'Mock ASR (测试用)',
               SherpaASREngine.kEngineId: 'Sherpa-ONNX 本地识别',
             },
             onChanged: (engineId) => service.switchASREngine(engineId),
@@ -818,11 +826,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           // MT 引擎选择
           _buildEngineSelector(
             label: 'MT 引擎',
-            hint: '把识别出的文字翻译成目标语言的组件。Mock 只加语言前缀，不做真正翻译。',
+            hint: '把识别出的文字翻译成目标语言的组件。模型未就绪时显示「未加载」。',
             currentEngine: service.engineManager.currentMTId,
             availableEngines: service.engineManager.getRegisteredMTEngines(),
             engineDisplayNames: const {
-              'mock_mt': 'Mock MT (测试用)',
               LlamaMTEngine.kEngineId: 'Hy-MT1.5 本地翻译',
             },
             onChanged: (engineId) => service.switchMTEngine(engineId),

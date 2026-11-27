@@ -90,6 +90,26 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
   /// 说明：Android 10+ 的分区存储不允许直接把任意 URI 当普通路径读写，
   /// 因此这里允许用户**手输绝对路径**（如 SD 卡或 Download 下的目录），
   /// 同时提供「填入常见路径」快捷项，避免用户无路可循。
+  ///
+  /// ## 为什么要这么小心地处理键盘（v0.5.0 修复）
+  ///
+  /// 旧实现是 `AlertDialog(content: Column(...))`。这有个真机必现的 UI 问题：
+  ///
+  /// - `AlertDialog` 把 `content` 放进一个 `Flexible` 里；
+  /// - 输入法弹出时 `windowSoftInputMode="adjustResize"` 会让可用高度骤减；
+  /// - 但 `Column(mainAxisSize: MainAxisSize.min)` **不会自动滚动**，
+  ///   只能被压缩 —— 于是文字被挤得上下位移，`Wrap` 里的路径芯片挤成
+  ///   两行/三行，整个对话框「变形」。
+  ///
+  /// 三条修复（缺一不可）：
+  /// 1. `content` 外面套 `SingleChildScrollView` —— 空间不够就滚动，
+  ///    而不是压缩子节点（这是标准做法）；
+  /// 2. `insetPadding` 给足左右/上下留白，避免边距被键盘顶到 0；
+  /// 3. 用 `MediaQuery.viewInsetsOf(context).bottom` 让对话框整体上移，
+  ///    输入框不会被键盘盖住。
+  ///
+  /// 另外顺手补上 `controller.dispose()`：`TextEditingController` 是
+  /// 需要释放的资源，旧实现每打开一次对话框就漏一个。
   Future<void> _pickDirectory() async {
     final controller = TextEditingController(
       text: _status?.directoryPath ?? '',
@@ -100,65 +120,89 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
       builder: (dialogContext) {
         return AlertDialog(
           backgroundColor: const Color(0xFF1E1E1E),
+          // 内边距：左右至少 16，避免贴到屏幕边缘。
+          // 上下留白交给 Dialog 自带的 AnimatedPadding 处理 ——
+          // 它会读 viewInsets 把对话框整体推到键盘上方，
+          // 这里再手算一次反而会叠加、把小屏挤得更惨。
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 24,
+          ),
           title: const Text('设置模型目录', style: TextStyle(color: Colors.white)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '填写模型所在的绝对路径，App 会从中读取模型文件。'
-                '留空则恢复默认的私有目录。',
-                style: TextStyle(
-                  color: Colors.grey[500],
-                  fontSize: 12,
-                  height: 1.6,
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                style: const TextStyle(color: Colors.white, fontSize: 13),
-                decoration: InputDecoration(
-                  hintText: '/storage/emulated/0/Download/models',
-                  hintStyle: TextStyle(color: Colors.grey[700], fontSize: 12),
-                  filled: true,
-                  fillColor: const Color(0xFF2A2A2A),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: BorderSide.none,
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 12,
+          // 关键：可滚动 + min 尺寸。两者必须同时存在，
+          // 只写 min 会被压缩，只写 scroll 会让对话框占满高度。
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '填写模型所在的绝对路径，App 会从中读取模型文件。'
+                  '留空则恢复默认的私有目录。',
+                  style: TextStyle(
+                    color: Colors.grey[500],
+                    fontSize: 12,
+                    height: 1.6,
                   ),
                 ),
-              ),
-              const SizedBox(height: 10),
-              Text(
-                '常见位置',
-                style: TextStyle(color: Colors.grey[600], fontSize: 11),
-              ),
-              const SizedBox(height: 4),
-              Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: [
-                  '/storage/emulated/0/Download/models',
-                  '/storage/emulated/0/Android/data/com.example.live_translate/files/models',
-                ].map((p) {
-                  return ActionChip(
-                    label: Text(
-                      '${p.split('/').take(5).join('/')}/…',
-                      style: TextStyle(color: Colors.grey[400], fontSize: 10),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  // 单行：路径是单行的，允许多行会让回车变成换行而不是提交
+                  maxLines: 1,
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (value) =>
+                      Navigator.of(dialogContext).pop(value),
+                  decoration: InputDecoration(
+                    hintText: '/storage/emulated/0/Download/models',
+                    hintStyle: TextStyle(color: Colors.grey[700], fontSize: 12),
+                    filled: true,
+                    fillColor: const Color(0xFF2A2A2A),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: BorderSide.none,
                     ),
-                    backgroundColor: const Color(0xFF2A2A2A),
-                    side: const BorderSide(color: Colors.white10),
-                    onPressed: () => controller.text = p,
-                  );
-                }).toList(),
-              ),
-            ],
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '常见位置',
+                  style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    '/storage/emulated/0/Download/models',
+                    '/storage/emulated/0/Android/data/com.example.live_translate/files/models',
+                  ].map((p) {
+                    return ActionChip(
+                      label: Text(
+                        '${p.split('/').take(5).join('/')}/…',
+                        style: TextStyle(color: Colors.grey[400], fontSize: 10),
+                      ),
+                      backgroundColor: const Color(0xFF2A2A2A),
+                      side: const BorderSide(color: Colors.white10),
+                      onPressed: () {
+                        controller.text = p;
+                        // 手动把光标放到末尾：赋值不会自动移动光标，
+                        // 用户接着输入就会插到中间，很别扭。
+                        controller.selection = TextSelection.fromPosition(
+                          TextPosition(offset: controller.text.length),
+                        );
+                      },
+                    );
+                  }).toList(),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -177,6 +221,9 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
         );
       },
     );
+
+    // 对话框已关闭，控制器不再需要；不释放会一直持有监听与文本缓冲
+    controller.dispose();
 
     if (result == null) return;
 
@@ -286,6 +333,25 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
             if (!mounted) return;
             setState(() => _downloading = false);
             await _refresh();
+            // 下载管线正常结束时 onDone 只代表「流关了」，还要看最后一张
+            // 快照是不是成功。失败/取消时也走 onDone，不能一律提示成功。
+            if (!mounted) return;
+            final last = _progress;
+            if (last != null && last.fatalError != null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(last.fatalError!),
+                  action: SnackBarAction(
+                    label: '重试',
+                    onPressed: _startDownload,
+                  ),
+                ),
+              );
+            } else {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('模型下载完成，已切换到真实引擎')),
+              );
+            }
           },
         );
   }
@@ -361,7 +427,7 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
     } else if (!status.hasAnyAsrFile && !status.mtReady) {
       accent = Colors.orangeAccent;
       title = '尚未安装模型';
-      subtitle = '当前只能使用 Mock 引擎，请用下方一键下载安装';
+      subtitle = '尚未安装任何模型，请在下方一键下载后才能开始翻译';
     } else {
       accent = Colors.orangeAccent;
       title = '模型不完整';
@@ -632,11 +698,28 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
   }
 
   /// 真实进度展示
+  ///
+  /// 三层信息，从「发生了什么」到「还要多久」逐级递进：
+  /// 1. 状态文本（正在下载 xxx / 已取消 / 完成）
+  /// 2. 字节数 + 百分比 + 速度 + 剩余时间
+  /// 3. 文件级进度（第 3/5 个）
+  ///
+  /// 1.06GB 的翻译权重在普通网络下要下十几分钟，只给一个百分比
+  /// 用户体验很差 —— 「还要多久」才是他真正关心的。
   Widget _buildProgress(ModelDownloadProgress p) {
     final failed = p.fatalError != null && !p.isCancelled;
     final color = p.isSuccess
         ? Colors.greenAccent
         : (failed ? Colors.redAccent : Colors.blue);
+
+    final speed = p.speedLabel;
+    final remaining = p.remainingLabel;
+    // 右下角那一行：`已下载 / 总计 · 3.4MB/s · 约 4 分 12 秒`
+    final metaParts = <String>[
+      '${p.downloadedLabel} / ${p.totalLabel}',
+      if (speed.isNotEmpty) speed,
+      if (remaining.isNotEmpty) remaining,
+    ];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -659,9 +742,16 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            // 百分比放最右：进度条动的时候这个数字一起跳，
+            // 视觉上确认「真的在下载」而不是卡住了
             Text(
-              '${p.downloadedLabel} / ${p.totalLabel}',
-              style: TextStyle(color: Colors.grey[500], fontSize: 10),
+              '${p.percent}%',
+              style: TextStyle(
+                color: color,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
             ),
           ],
         ),
@@ -669,11 +759,36 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
         ClipRRect(
           borderRadius: BorderRadius.circular(4),
           child: LinearProgressIndicator(
+            // 已结束但没有成功时（取消 / 失败），value 停在原地会让人以为
+            // 还在跑。这里用 min(1.0) 保持原样更好 —— 停在哪就是哪，
+            // 配合上面的「已取消」文案，语义是清楚的。
             value: p.fraction,
             minHeight: 6,
             backgroundColor: const Color(0xFF2A2A2A),
             valueColor: AlwaysStoppedAnimation<Color>(color),
           ),
+        ),
+        const SizedBox(height: 6),
+        // 速度 / 剩余时间 / 文件序号，一行放不下就换行
+        Wrap(
+          spacing: 10,
+          runSpacing: 2,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              metaParts.join(' · '),
+              style: TextStyle(
+                color: Colors.grey[500],
+                fontSize: 10,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+            if (p.fileCount > 0)
+              Text(
+                '文件 ${p.fileIndex}/${p.fileCount}',
+                style: TextStyle(color: Colors.grey[700], fontSize: 10),
+              ),
+          ],
         ),
         if (p.fatalError != null) ...[
           const SizedBox(height: 6),
@@ -684,13 +799,6 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
               fontSize: 10,
               height: 1.5,
             ),
-          ),
-        ],
-        if (p.fileCount > 0) ...[
-          const SizedBox(height: 6),
-          Text(
-            '文件 ${p.fileIndex}/${p.fileCount}',
-            style: TextStyle(color: Colors.grey[700], fontSize: 10),
           ),
         ],
       ],

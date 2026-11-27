@@ -110,8 +110,9 @@ void main() {
       );
       await tester.pump();
 
-      // 未初始化引擎 / Mock 引擎都应为 Mock 模式
-      expect(find.text('Mock 模式'), findsOneWidget);
+      // v0.5.0：Mock 引擎已从运行时移除，未初始化时显示「未加载」。
+      // 一共三处：右上角徽章 + 「ASR 引擎」行 + 「MT 引擎」行。
+      expect(find.text('未加载'), findsNWidgets(3));
 
       service.dispose();
     });

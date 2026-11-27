@@ -3,7 +3,12 @@
 library live_translate.test.translation_service_test;
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:live_translate/core/engine/engine.dart';
+// 精确到文件：Mock 实现已从 engine.dart 的 barrel 里移除
+// （v0.5.0 起运行时不再注册 Mock 引擎），测试仍然需要它们来验证接口契约。
+import 'package:live_translate/core/engine/asr_engine.dart';
+import 'package:live_translate/core/engine/mock_asr.dart';
+import 'package:live_translate/core/engine/mock_mt.dart';
+import 'package:live_translate/core/engine/mt_engine.dart';
 
 void main() {
   group('TranslationService', () {

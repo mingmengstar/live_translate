@@ -12,6 +12,45 @@
 /// 3. 悬浮窗权限是 Android 的特殊权限（SYSTEM_ALERT_WINDOW），必须走
 ///    MainActivity 的 startActivityForResult 路径才能可靠拿到授权结果；
 ///    插件自带的 requestPermission 依赖 Activity 绑定，在 Service 场景不可靠。
+///
+/// ## v0.5.0：为什么「窗口不显示」修不掉（根因）
+///
+/// 旧实现有一个**致命的信任错误**：它把 `showOverlay()` 返回成功
+/// 当成「窗口已经显示」，置 `_isShowing = true`。但读插件源码可知：
+///
+/// ```java
+/// } else if (call.method.equals("showOverlay")) {
+///     ...
+///     try {
+///         context.startService(intent);   // 只是「投递了一个 Intent」
+///     } catch (Exception e) { ... }
+///     result.success(null);              // ← 立刻返回成功
+/// }
+/// ```
+///
+/// `startService()` 成功**只代表系统接受了这个 Intent**。真正把 FlutterView
+/// 挂到 WindowManager 上是在 `OverlayService.onStartCommand()` 里做的，
+/// 而它可能在这里失败（全部被 catch 住、`stopSelf()`、**不通知 Dart 侧**）：
+///
+/// - `BadTokenException`：Activity 在服务启动瞬间被销毁（热启动常见）；
+/// - `WindowManager$BadTokenException`：悬浮窗权限被系统临时收回；
+/// - `FlutterEngineCache` 里的引擎被低内存回收（`engine == null` → 直接 stopSelf）；
+/// - `startForeground()` 抛 `ForegroundServiceStartNotAllowedException`
+///   （应用刚进后台，Android 12+ 的后台启动限制）。
+///
+/// 这些情况下的表现完全一致：**Dart 侧收到 success，屏幕上什么都没有**，
+/// 而且 `_isShowing` 已经被置 true —— 之后每一次 `show()` 都走
+/// `if (_isShowing) return success;` 直接短路，**永远不会重试**。
+/// 用户只能杀进程重开。这就是「点开始没反应、点重新显示也没反应」的来源。
+///
+/// ### 修法
+///
+/// 用插件自己提供的 `isActive()`（原生侧读 `OverlayService.isRunning`）
+/// 做**产物级确认**：`showOverlay()` 之后轮询它，只有真的 true 才算成功。
+/// 这是唯一能区分「Intent 投递成功」和「View 真的挂上去了」的判据。
+///
+/// 轮询而不是单次查询的原因：`startService()` 是异步的，
+/// `result.success` 返回时 `onCreate` 可能还没跑，立刻查必然是 false。
 library live_translate.core.overlay.overlay_controller;
 
 import 'dart:developer';
@@ -26,6 +65,7 @@ class OverlayShowResult {
   const OverlayShowResult({
     required this.ok,
     this.reason,
+    this.code,
   });
 
   /// 是否成功显示
@@ -34,15 +74,24 @@ class OverlayShowResult {
   /// 失败原因（可直接展示给用户）
   final String? reason;
 
+  /// 机器可读的错误码，便于日志检索
+  ///
+  /// - `PERMISSION`：没有「显示在其他应用上层」权限
+  /// - `SERVICE_START`：前台服务起不来（manifest / 后台启动限制）
+  /// - `NOT_ATTACHED`：服务起来了但 FlutterView 没挂上窗口
+  /// - `EXCEPTION`：其它异常
+  final String? code;
+
   static const OverlayShowResult success = OverlayShowResult(ok: true);
 
   @override
-  String toString() => ok ? 'OverlayShowResult(ok)' : 'OverlayShowResult(fail: $reason)';
+  String toString() =>
+      ok ? 'OverlayShowResult(ok)' : 'OverlayShowResult(fail: $code/$reason)';
 }
 
 /// 悬浮字幕条的高度（dp）
 ///
-/// 需要容纳：顶部 40dp 控制栏 + 原文一行 + 译文一行 + 内边距。
+/// 需要容纳：顶部 34dp 控制栏 + 原文一行 + 译文一行 + 内边距。
 /// 实际渲染内容超过这个高度时，overlay 侧会裁剪（maxLines + ellipsis），
 /// 因此这里是「上限」而不是「精确值」。
 const double kOverlayHeightDp = 180.0;
@@ -53,6 +102,15 @@ const double kOverlaySidePaddingDp = 12.0;
 /// 字幕条宽度上限（dp），平板上避免拉成一条超宽的横条
 const double kOverlayMaxWidthDp = 720.0;
 
+/// 确认窗口真的挂上去的轮询参数
+///
+/// 总等待 1.6s（200ms × 8）。为什么不是更长：
+/// 冷启动 overlayMain 约 5s，但那是**引擎**启动，`addView` 是引擎启动前
+/// 就完成的；正常路径下 200ms 内 `isRunning` 就会是 true。
+/// 等太久会让 UI 卡在「正在显示悬浮窗…」。
+const Duration _kVerifyInterval = Duration(milliseconds: 200);
+const int _kVerifyAttempts = 8;
+
 class OverlayController {
   OverlayController._();
 
@@ -62,10 +120,18 @@ class OverlayController {
   static const MethodChannel _permissionChannel =
       MethodChannel('live_translate/permissions');
 
-  /// 悬浮窗是否已由本控制器显示
+  /// 悬浮窗是否已由本控制器显示（**仅为乐观标记**）
+  ///
+  /// 注意：这个字段**不能**作为「窗口真的在屏幕上」的依据，
+  /// 它只用于短路重复调用。真正的判据永远走 [isActuallyActive]。
+  /// 详见文件头「为什么窗口不显示修不掉」一节。
   bool _isShowing = false;
 
+  /// 对外语义：最近一次 show 成功
   bool get isShowing => _isShowing;
+
+  /// 并发保护：正在 show 的过程中再次调用 show 直接返回
+  bool _showInFlight = false;
 
   /// 检查悬浮窗权限（不弹框）
   Future<bool> hasPermission() async {
@@ -92,6 +158,21 @@ class OverlayController {
       log('[Overlay] 请求悬浮窗权限失败: $e', name: 'OverlayController');
       return false;
     } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 原生侧是否真的认为窗口活着
+  ///
+  /// 读的是插件 `OverlayService.isRunning`（同一进程的静态字段）。
+  /// 这是**唯一**能区分「Intent 投递成功」与「View 真的挂上去了」的判据。
+  Future<bool> isActuallyActive() async {
+    try {
+      return await overlay.FlutterScreenOverlay.isActive();
+    } catch (e) {
+      // 平台通道不可用（单元测试 / 非 Android）：保守返回 false，
+      // 调用方会走「无法确认」分支，不会误报成功。
+      log('[Overlay] isActive 查询失败: $e', name: 'OverlayController');
       return false;
     }
   }
@@ -153,18 +234,49 @@ class OverlayController {
   /// 6. **位置来自 `settings.position`**：`showOverlay()` 的 `alignment`
   ///    只在创建窗口时生效，`moveOverlay()` 只改 x/y 像素偏移、不改
   ///    gravity。所以「换位置」必然是一次关窗 + 开窗（见 [reposition]）。
+  ///
+  /// 7. **必须验证窗口真的挂上了**（v0.5.0）。见文件头注释。
   Future<OverlayShowResult> show({
     SubtitlePosition? position,
   }) async {
+    // 已经在显示：不要盲目相信自己，向原生确认一次。
+    // 原生说不在 → 说明窗口被系统回收了（低内存 / 后台限制），
+    // 清掉乐观标记继续往下走，而不是短路返回一个假的成功。
     if (_isShowing) {
-      return OverlayShowResult.success;
+      if (await isActuallyActive()) {
+        return OverlayShowResult.success;
+      }
+      log(
+        '[Overlay] 本地标记为已显示，但原生侧窗口已消失，重新创建',
+        name: 'OverlayController',
+      );
+      _isShowing = false;
     }
 
+    // 并发保护：连续点两次「开始」不该起两个窗口
+    if (_showInFlight) {
+      return const OverlayShowResult(
+        ok: false,
+        code: 'IN_FLIGHT',
+        reason: '悬浮窗正在显示中，请稍候',
+      );
+    }
+    _showInFlight = true;
+
+    try {
+      return await _showInternal(position);
+    } finally {
+      _showInFlight = false;
+    }
+  }
+
+  Future<OverlayShowResult> _showInternal(SubtitlePosition? position) async {
     if (!await hasPermission()) {
       final granted = await requestPermission();
       if (!granted) {
         return const OverlayShowResult(
           ok: false,
+          code: 'PERMISSION',
           reason: '未获得「显示在其他应用上层」权限',
         );
       }
@@ -175,8 +287,8 @@ class OverlayController {
         ? 1.0
         : PlatformDispatcher.instance.views.first.devicePixelRatio;
     final size = _targetSizeDp();
-    final alignment = (position ?? OverlaySettingsStore.instance.current.position)
-        .alignment;
+    final alignment =
+        (position ?? OverlaySettingsStore.instance.current.position).alignment;
 
     try {
       await overlay.FlutterScreenOverlay.showOverlay(
@@ -189,6 +301,29 @@ class OverlayController {
         enableDrag: false,
         wakeScreen: false,
       );
+
+      // ---- 关键：确认窗口真的挂上了 ----
+      //
+      // showOverlay 的 success 只代表 Intent 投递成功。这里轮询原生
+      // 的 isRunning，只有真的 true 才敢报成功。
+      final mounted = await _waitUntilActive();
+      if (!mounted) {
+        _isShowing = false;
+        log(
+          '[Overlay] showOverlay 返回成功，但窗口始终未挂载'
+          '（OverlayService.isRunning=false）。'
+          '常见原因：后台启动限制 / BadToken / 引擎被回收。',
+          name: 'OverlayController',
+        );
+        return const OverlayShowResult(
+          ok: false,
+          code: 'NOT_ATTACHED',
+          reason: '悬浮窗服务已启动，但窗口没有挂到屏幕上。'
+              '请确认已授予「显示在其他应用上层」权限，'
+              '并把 App 切回前台后重试',
+        );
+      }
+
       _isShowing = true;
       log(
         '[Overlay] 悬浮窗已显示 '
@@ -203,12 +338,30 @@ class OverlayController {
         '[Overlay] showOverlay 失败: code=${e.code} message=${e.message}',
         name: 'OverlayController',
       );
-      return OverlayShowResult(ok: false, reason: reason);
+      return OverlayShowResult(ok: false, code: e.code, reason: reason);
     } catch (e) {
       _isShowing = false;
       log('[Overlay] showOverlay 异常: $e', name: 'OverlayController');
-      return OverlayShowResult(ok: false, reason: '悬浮窗启动异常: $e');
+      return OverlayShowResult(
+        ok: false,
+        code: 'EXCEPTION',
+        reason: '悬浮窗启动异常: $e',
+      );
     }
+  }
+
+  /// 轮询 `isActive()`，直到窗口真的挂上或超时
+  ///
+  /// 为什么需要轮询：`startService()` 是异步的，`showOverlay()` 的
+  /// `result.success` 返回时 `OverlayService.onCreate()` 可能还没执行，
+  /// 立刻查必然是 false（会误判成失败）。
+  Future<bool> _waitUntilActive() async {
+    for (var i = 0; i < _kVerifyAttempts; i++) {
+      if (await isActuallyActive()) return true;
+      await Future<void>.delayed(_kVerifyInterval);
+    }
+    // 最后一轮：避免刚好在最后一次 delay 之后才就绪
+    return isActuallyActive();
   }
 
   /// 关闭悬浮字幕窗口
@@ -257,8 +410,22 @@ class OverlayController {
   ///
   /// 因此本方法**只负责窗口**，不负责把设置推过去 ——
   /// 那是 `TranslationService` 在 `requestSync` 里做的事。
+  ///
+  /// ## 关窗是异步的
+  ///
+  /// `closeOverlay()` → `context.stopService()` → `onDestroy()` 也是异步的。
+  /// 紧接着 `showOverlay()` 时，旧的 `onStartCommand` 可能还在跑，
+  /// 插件会用 `windowManager != null || flutterView != null` 判断并先 detach
+  /// 再重建，所以不会冲突；但**必须等一下**让 `isRunning` 回落，
+  /// 否则新的验证会读到旧的 true 而误报成功。
   Future<OverlayShowResult> reposition(SubtitlePosition position) async {
     await hide();
+    // 等原生侧 isRunning 真的变 false（最多 600ms），
+    // 避免新窗口的验证读到旧窗口的残留状态。
+    for (var i = 0; i < 3; i++) {
+      if (!await isActuallyActive()) break;
+      await Future<void>.delayed(_kVerifyInterval);
+    }
     return show(position: position);
   }
 
@@ -273,7 +440,7 @@ class OverlayController {
         return '缺少「显示在其他应用上层」权限，请在系统设置中开启';
       case 'SERVICE_START':
         return '悬浮窗服务启动失败（通常是 APK 未声明 OverlayService '
-            '或缺少前台服务权限）';
+            '或缺少前台服务权限，也可能是应用在后台被系统限制启动）';
       default:
         return '悬浮窗启动失败：${e.code}${e.message == null ? '' : ' / ${e.message}'}';
     }

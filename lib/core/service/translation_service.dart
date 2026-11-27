@@ -100,15 +100,30 @@ class TranslationService extends ChangeNotifier {
   /// 引擎选择说明（为何当前是 Mock / 真实引擎，如「模型缺失（2/6），使用 Mock 引擎」）
   String? get engineNote => _engineNote;
   
-  /// 初始化服务：注册 Mock 引擎、初始化音频捕获
+  /// 初始化服务：注册真实引擎、初始化音频捕获
+  ///
+  /// ## v0.5.0：为什么不再注册 / 不自动降级到 Mock
+  ///
+  /// 旧实现会在模型缺失或真实引擎加载失败时**静默**切到 `MockASR`/`MockMT`。
+  /// 这在真机上是灾难性的：
+  ///
+  /// - Mock ASR 每 3 秒吐一句预置的假文本，Mock MT 只加 `【日】` 前缀；
+  /// - 用户看到字幕条「有内容」，会以为识别和翻译都在工作，
+  ///   实际上一句真实语音都没被处理；
+  /// - 更糟的是 `engineNote` 只在主界面某一行小字里提一句，
+  ///   而悬浮窗上完全看不出这是假数据。
+  ///
+  /// 现在：**没有模型就是没有模型**。初始化会明确失败并把原因写进
+  /// [engineNote] / [lastError]，UI 直接显示「缺少模型，请先下载」。
+  /// 这样用户点「开始」之前就知道能不能用，不会对着假字幕调试半天。
+  ///
+  /// `MockASR` / `MockMT` 类仍然保留在 `lib/core/engine/mock_*.dart`，
+  /// 但**只被 `test/` 引用**（验证引擎接口契约），不参与运行时注册，
+  /// release 构建会把它们 tree-shake 掉。
   Future<void> initialize() async {
     _updateStatus('正在初始化引擎...');
-    
-    // 注册 Mock 引擎（永远可用，作为兜底）
-    _engineManager.registerASREngine('mock_asr', () => MockASR());
-    _engineManager.registerMTEngine('mock_mt', () => MockMT());
 
-    // 注册真实引擎（需要模型文件；initialize 失败会被 EngineManager 捕获并降级）
+    // 注册真实引擎（需要模型文件；initialize 失败会被 EngineManager 捕获）
     _engineManager.registerASREngine(
       SherpaASREngine.kEngineId,
       () => SherpaASREngine(),
@@ -120,70 +135,57 @@ class TranslationService extends ChangeNotifier {
 
     // ---- 选择「用哪套引擎」----
     //
-    // 策略：模型齐全就优先真实引擎，缺任何一件就整体回 Mock。
-    // 之所以「整体」而不是「ASR 真实 + MT Mock」混搭：
-    // 混搭时真实 ASR 出的文本会被 MockMT 加上 `【日】` 前缀，
-    // 看起来像「翻译坏了」，实际是 MT 是假的，排查成本很高。
-    // 宁可两边都 Mock，状态明确。
-    var asrEngineId = 'mock_asr';
-    var mtEngineId = 'mock_mt';
+    // 只有模型齐全才尝试加载真实引擎。缺任何一件都保持「未加载」状态，
+    // 由 UI 引导用户去「模型管理」下载，而不是偷偷跑假数据。
     String? engineNote;
+    var modelsReady = false;
 
     try {
       final status = await ModelStorage.instance.inspect();
-      if (!status.hasError && status.isReady) {
-        asrEngineId = SherpaASREngine.kEngineId;
-        mtEngineId = LlamaMTEngine.kEngineId;
-        engineNote = '模型齐全，尝试加载真实引擎';
-      } else if (!status.hasError) {
-        engineNote = '模型缺失（${status.presentCount}/${status.totalCount}），'
-            '使用 Mock 引擎';
+      if (status.hasError) {
+        engineNote = '模型检测失败：${status.error}';
+      } else if (status.isReady) {
+        modelsReady = true;
+        engineNote = '模型齐全，正在加载真实引擎';
       } else {
-        engineNote = '模型检测失败，使用 Mock 引擎';
+        engineNote = '模型缺失（${status.presentCount}/${status.totalCount}），'
+            '请先到「模型管理」下载';
       }
     } catch (e) {
-      engineNote = '模型检测异常，使用 Mock 引擎: $e';
+      engineNote = '模型检测异常：$e';
       log('[TranslationService] 模型检测失败: $e', name: 'TranslationService');
     }
 
-    // 切换 ASR：真实引擎初始化失败时自动回落 Mock
-    var asrOk = await _engineManager.switchASREngine(
-      engineId: asrEngineId,
-      config: {'language': _asrLanguage},
-    );
-    if (!asrOk && asrEngineId != 'mock_asr') {
-      // switchASREngine 失败时已把 _currentASR 置 null，
-      // 但失败原因由 EngineManager.lastASRError 保留了，能给出具体说明。
-      final reason = _summarizeReason(_engineManager.lastASRError);
-      engineNote = '真实 ASR 加载失败，已降级 Mock'
-          '${reason == null ? '' : '（$reason）'}';
+    var asrOk = false;
+    var mtOk = false;
+
+    if (modelsReady) {
       asrOk = await _engineManager.switchASREngine(
-        engineId: 'mock_asr',
+        engineId: SherpaASREngine.kEngineId,
         config: {'language': _asrLanguage},
       );
-    }
+      if (!asrOk) {
+        // switchASREngine 失败时已把 _currentASR 置 null，
+        // 但失败原因由 EngineManager.lastASRError 保留了，能给出具体说明。
+        final reason = _summarizeReason(_engineManager.lastASRError);
+        engineNote = '真实 ASR 加载失败'
+            '${reason == null ? '' : '（$reason）'}';
+      }
 
-    // 切换 MT：同样失败回落 Mock
-    var mtOk = await _engineManager.switchMTEngine(
-      engineId: mtEngineId,
-      config: {
-        'sourceLang': _mtSourceLang,
-        'targetLang': _mtTargetLang,
-      },
-    );
-    if (!mtOk && mtEngineId != 'mock_mt') {
-      // 这里最常见的原因就是「当前 ABI 的 APK 里没有 llama.cpp 原生库」，
-      // 旧文案只说「加载失败」，用户完全无从判断，必须带出具体原因。
-      final reason = _summarizeReason(_engineManager.lastMTError);
-      engineNote = '真实 MT 加载失败，已降级 Mock'
-          '${reason == null ? '' : '（$reason）'}';
       mtOk = await _engineManager.switchMTEngine(
-        engineId: 'mock_mt',
+        engineId: LlamaMTEngine.kEngineId,
         config: {
           'sourceLang': _mtSourceLang,
           'targetLang': _mtTargetLang,
         },
       );
+      if (!mtOk) {
+        // 这里最常见的原因就是「当前 ABI 的 APK 里没有 llama.cpp 原生库」，
+        // 旧文案只说「加载失败」，用户完全无从判断，必须带出具体原因。
+        final reason = _summarizeReason(_engineManager.lastMTError);
+        engineNote = '真实 MT 加载失败'
+            '${reason == null ? '' : '（$reason）'}';
+      }
     }
 
     _engineNote = engineNote;
@@ -220,15 +222,17 @@ class TranslationService extends ChangeNotifier {
     );
 
     if (asrOk && mtOk) {
-      // 状态文案要反映真实引擎，不能固定写「Mock 模式」——
-      // 否则下载完全部模型、真实引擎已加载时，UI 还在说 Mock，
-      // 用户会以为下载没生效。
-      final isReal = _engineManager.currentASRId != 'mock_asr' &&
-          _engineManager.currentMTId != 'mock_mt';
-      _updateStatus(isReal ? '引擎就绪（真实引擎）' : '引擎就绪 (Mock 模式)');
+      _updateStatus('引擎就绪（真实引擎）');
+      _lastError = null;
+    } else if (!modelsReady) {
+      // 没模型：不是「失败」，是「还没准备好」。文案要能指导用户下一步，
+      // 而不是甩一句「初始化失败」让他去猜。
+      _updateStatus('等待模型');
       _lastError = null;
     } else {
-      _lastError = '引擎初始化失败';
+      // 走到这里说明模型齐全但引擎加载失败，engineNote 已在上面被赋成
+      // 具体原因（含「原生库缺失 / 加载超时」等），直接透传给用户。
+      _lastError = engineNote;
       _updateStatus('初始化失败');
     }
 
