@@ -24,6 +24,7 @@ library live_translate.core.service.app_settings;
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:live_translate/core/i18n/language_registry.dart';
 import 'package:live_translate/core/model/model_catalog.dart';
 
 /// 语言与引擎选择的持久化（单例，带内存缓存）
@@ -77,11 +78,35 @@ class AppSettingsStore {
     if (_loaded) return;
     try {
       final prefs = await SharedPreferences.getInstance();
-      _asrLanguage = _nonEmpty(prefs.getString(_kAsrLanguage), defaultAsrLanguage);
-      _mtSourceLang =
-          _nonEmpty(prefs.getString(_kMtSourceLang), defaultMtSourceLang);
-      _mtTargetLang =
-          _nonEmpty(prefs.getString(_kMtTargetLang), defaultMtTargetLang);
+      // 语言代码必须过一遍 [LanguageRegistry]：
+      //
+      // DropdownButton 的 `value` 必须能在 `items` 里找到，否则会直接抛
+      // 断言（debug）或渲染异常（release）。持久化里完全可能残留一个
+      // 「上一个版本的代码认识、这一版已经删掉」的语种代码，
+      // 那种情况必须静默退回默认值，不能白屏。
+      _asrLanguage = _knownOrDefault(
+        prefs.getString(_kAsrLanguage),
+        defaultAsrLanguage,
+      );
+      _mtSourceLang = _knownOrDefault(
+        prefs.getString(_kMtSourceLang),
+        defaultMtSourceLang,
+      );
+      _mtTargetLang = _knownOrDefault(
+        prefs.getString(_kMtTargetLang),
+        defaultMtTargetLang,
+      );
+      // 源语言 == 目标语言是非法状态：界面上的两个下拉框互斥（各自剔除
+      // 对方的当前值），一旦相等，两边的 `value` 都不在 `items` 里，
+      // DropdownButton 会直接抛断言。
+      //
+      // v0.7.0 之前的下拉框只有 4 项且不互斥，用户完全可能存下 `en→en`。
+      // 升级后必须能自动纠正，不能让老用户一打开就崩。
+      if (_mtSourceLang == _mtTargetLang) {
+        _mtTargetLang = _mtSourceLang == defaultMtTargetLang
+            ? defaultMtSourceLang
+            : defaultMtTargetLang;
+      }
       _asrVariant = _asrVariantFromWire(prefs.getString(_kAsrVariant));
       _mtVariant = _mtVariantFromWire(prefs.getString(_kMtVariant));
       _withVad = prefs.getBool(_kWithVad) ?? defaultWithVad;
@@ -99,14 +124,17 @@ class AppSettingsStore {
     String? mtSourceLang,
     String? mtTargetLang,
   }) async {
+    // 写入同样要过白名单：调用方传进来的可能是任意字符串
+    // （比如从下拉框以外的入口，或未来某个「自定义语言」功能）。
+    // 存进一个未知代码，下次启动下拉框就会崩。
     if (asrLanguage != null && asrLanguage.trim().isNotEmpty) {
-      _asrLanguage = asrLanguage.trim();
+      _asrLanguage = _knownOrDefault(asrLanguage, _asrLanguage);
     }
     if (mtSourceLang != null && mtSourceLang.trim().isNotEmpty) {
-      _mtSourceLang = mtSourceLang.trim();
+      _mtSourceLang = _knownOrDefault(mtSourceLang, _mtSourceLang);
     }
     if (mtTargetLang != null && mtTargetLang.trim().isNotEmpty) {
-      _mtTargetLang = mtTargetLang.trim();
+      _mtTargetLang = _knownOrDefault(mtTargetLang, _mtTargetLang);
     }
     _loaded = true;
     try {
@@ -152,9 +180,14 @@ class AppSettingsStore {
 
   // ---- 解析辅助 ----
 
-  static String _nonEmpty(String? raw, String fallback) {
+  /// 语言代码校验：空值 / 未知值一律退回 [fallback]
+  ///
+  /// 与 [_nonEmpty] 的区别只在于「多一道 LanguageRegistry 白名单」。
+  /// 不能只判非空 —— 一个已经不在清单里的代码会让下拉框直接崩。
+  static String _knownOrDefault(String? raw, String fallback) {
     final value = raw?.trim();
-    return (value == null || value.isEmpty) ? fallback : value;
+    if (value == null || value.isEmpty) return fallback;
+    return LanguageRegistry.isKnown(value) ? value : fallback;
   }
 
   /// 未知 / 已删除的枚举值必须退回默认，不能抛异常

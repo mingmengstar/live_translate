@@ -5,6 +5,7 @@ library live_translate.ui.main_screen;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:live_translate/core/engine/engine.dart';
+import 'package:live_translate/core/i18n/language_registry.dart';
 import 'package:live_translate/core/service/translation_service.dart';
 
 /// 检测是否在测试环境中
@@ -23,7 +24,7 @@ final bool _kIsTestEnvironment = _isTestEnvironment();
 
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
-  
+
   @override
   State<MainScreen> createState() => _MainScreenState();
 }
@@ -33,28 +34,28 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   late AnimationController _pulseController;
   late Animation<double> _glowAnimation;
   late Animation<double> _pulseAnimation;
-  
+
   @override
   void initState() {
     super.initState();
-    
+
     // 发光动画控制器 - 只在非测试环境创建动画
     if (!_kIsTestEnvironment) {
       _glowController = AnimationController(
         duration: const Duration(seconds: 2),
         vsync: this,
       )..repeat(reverse: true);
-      
+
       _glowAnimation = Tween<double>(begin: 0.3, end: 1.0).animate(
         CurvedAnimation(parent: _glowController, curve: Curves.easeInOut),
       );
-      
+
       // 脉冲动画控制器（运行时）
       _pulseController = AnimationController(
         duration: const Duration(milliseconds: 1000),
         vsync: this,
       );
-      
+
       _pulseAnimation = Tween<double>(begin: 1.0, end: 1.1).animate(
         CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
       );
@@ -65,7 +66,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         vsync: this,
       );
       _glowAnimation = AlwaysStoppedAnimation(0.5);
-      
+
       _pulseController = AnimationController(
         duration: const Duration(milliseconds: 1),
         vsync: this,
@@ -73,14 +74,14 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       _pulseAnimation = AlwaysStoppedAnimation(1.0);
     }
   }
-  
+
   @override
   void dispose() {
     _glowController.dispose();
     _pulseController.dispose();
     super.dispose();
   }
-  
+
   @override
   Widget build(BuildContext context) {
     return Consumer<TranslationService>(
@@ -89,12 +90,13 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         if (!_kIsTestEnvironment) {
           if (service.isServiceRunning && !_pulseController.isAnimating) {
             _pulseController.repeat(reverse: true);
-          } else if (!service.isServiceRunning && _pulseController.isAnimating) {
+          } else if (!service.isServiceRunning &&
+              _pulseController.isAnimating) {
             _pulseController.stop();
             _pulseController.reset();
           }
         }
-        
+
         return Scaffold(
           backgroundColor: const Color(0xFF121212),
           body: SafeArea(
@@ -102,7 +104,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               children: [
                 // 顶部状态栏区域
                 _buildHeader(context, service),
-                
+
                 // 主内容区域
                 Expanded(
                   child: SingleChildScrollView(
@@ -111,24 +113,24 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                       children: [
                         // 主控制卡片
                         _buildMainControlCard(context, service),
-                        
+
                         const SizedBox(height: 16),
-                        
+
                         // 状态信息卡片
                         _buildStatusCard(context, service),
-                        
+
                         const SizedBox(height: 16),
-                        
+
                         // 语言设置卡片
                         _buildLanguageCard(context, service),
-                        
+
                         const SizedBox(height: 16),
-                        
+
                         // 引擎选择卡片
                         _buildEngineCard(context, service),
-                        
+
                         const SizedBox(height: 16),
-                        
+
                         // 字幕历史卡片
                         _buildSubtitleHistoryCard(context, service),
                       ],
@@ -142,7 +144,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       },
     );
   }
-  
+
   /// 顶部头部
   Widget _buildHeader(BuildContext context, TranslationService service) {
     return Container(
@@ -206,10 +208,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 ),
                 Text(
                   service.statusMessage,
-                  style: TextStyle(
-                    color: Colors.grey[400],
-                    fontSize: 12,
-                  ),
+                  style: TextStyle(color: Colors.grey[400], fontSize: 12),
                 ),
               ],
             ),
@@ -221,9 +220,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             height: 12,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: service.isServiceRunning 
-                  ? Colors.greenAccent 
-                  : (service.lastError != null ? Colors.redAccent : Colors.grey),
+              color: service.isServiceRunning
+                  ? Colors.greenAccent
+                  : (service.lastError != null
+                        ? Colors.redAccent
+                        : Colors.grey),
               boxShadow: service.isServiceRunning
                   ? [
                       BoxShadow(
@@ -239,19 +240,19 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
+
   /// 主控制卡片（大按钮）
-  Widget _buildMainControlCard(BuildContext context, TranslationService service) {
+  Widget _buildMainControlCard(
+    BuildContext context,
+    TranslationService service,
+  ) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
         color: const Color(0xFF1E1E1E),
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: Colors.blue.withValues(alpha: 0.2),
-          width: 1,
-        ),
+        border: Border.all(color: Colors.blue.withValues(alpha: 0.2), width: 1),
         boxShadow: [
           BoxShadow(
             color: Colors.blue.withValues(alpha: 0.05),
@@ -269,23 +270,27 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               service.isServiceRunning ? '正在监听系统音频...' : '点击开始实时翻译',
               key: ValueKey(service.isServiceRunning),
               style: TextStyle(
-                color: service.isServiceRunning ? Colors.blue[300] : Colors.grey[400],
+                color: service.isServiceRunning
+                    ? Colors.blue[300]
+                    : Colors.grey[400],
                 fontSize: 16,
                 fontWeight: FontWeight.w500,
               ),
             ),
           ),
-          
+
           const SizedBox(height: 32),
-          
+
           // 发光播放/停止按钮
           AnimatedBuilder(
             animation: Listenable.merge([_glowAnimation, _pulseAnimation]),
             builder: (context, child) {
               final isRunning = service.isServiceRunning;
-              final glowIntensity = isRunning ? _pulseAnimation.value * _glowAnimation.value : _glowAnimation.value;
+              final glowIntensity = isRunning
+                  ? _pulseAnimation.value * _glowAnimation.value
+                  : _glowAnimation.value;
               final scale = isRunning ? _pulseAnimation.value : 1.0;
-              
+
               return Transform.scale(
                 scale: scale,
                 child: GestureDetector(
@@ -330,11 +335,16 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                         transitionBuilder: (child, animation) {
                           return RotationTransition(
                             turns: animation,
-                            child: ScaleTransition(scale: animation, child: child),
+                            child: ScaleTransition(
+                              scale: animation,
+                              child: child,
+                            ),
                           );
                         },
                         child: Icon(
-                          isRunning ? Icons.stop_rounded : Icons.play_arrow_rounded,
+                          isRunning
+                              ? Icons.stop_rounded
+                              : Icons.play_arrow_rounded,
                           key: ValueKey(isRunning),
                           color: Colors.white,
                           size: 44,
@@ -346,17 +356,18 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               );
             },
           ),
-          
+
           const SizedBox(height: 24),
-          
+
           // 当前识别文本预览
-          if (service.currentPartialText.isNotEmpty || service.currentTranslatedPartial.isNotEmpty)
+          if (service.currentPartialText.isNotEmpty ||
+              service.currentTranslatedPartial.isNotEmpty)
             _buildLivePreview(service),
         ],
       ),
     );
   }
-  
+
   /// 实时预览区域
   Widget _buildLivePreview(TranslationService service) {
     return Container(
@@ -391,8 +402,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 200),
             child: Text(
-              service.currentPartialText.isNotEmpty 
-                  ? service.currentPartialText 
+              service.currentPartialText.isNotEmpty
+                  ? service.currentPartialText
                   : '等待语音输入...',
               key: ValueKey(service.currentPartialText),
               style: TextStyle(
@@ -408,7 +419,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             const SizedBox(height: 12),
             Row(
               children: [
-                Icon(Icons.translate_rounded, size: 16, color: Colors.greenAccent[200]),
+                Icon(
+                  Icons.translate_rounded,
+                  size: 16,
+                  color: Colors.greenAccent[200],
+                ),
                 const SizedBox(width: 8),
                 Text(
                   '实时翻译',
@@ -440,7 +455,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
+
   /// 状态信息卡片
   Widget _buildStatusCard(BuildContext context, TranslationService service) {
     return _buildCard(
@@ -448,25 +463,39 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       icon: Icons.info_outline_rounded,
       child: Column(
         children: [
-          _buildStatusRow('运行状态', service.isServiceRunning ? '运行中' : '已停止', 
-              valueColor: service.isServiceRunning ? Colors.greenAccent : Colors.grey),
-          _buildStatusRow('ASR 引擎', service.engineManager.currentASR?.displayName ?? '未选择'),
-          _buildStatusRow('MT 引擎', service.engineManager.currentMT?.displayName ?? '未选择'),
+          _buildStatusRow(
+            '运行状态',
+            service.isServiceRunning ? '运行中' : '已停止',
+            valueColor: service.isServiceRunning
+                ? Colors.greenAccent
+                : Colors.grey,
+          ),
+          _buildStatusRow(
+            'ASR 引擎',
+            service.engineManager.currentASR?.displayName ?? '未选择',
+          ),
+          _buildStatusRow(
+            'MT 引擎',
+            service.engineManager.currentMT?.displayName ?? '未选择',
+          ),
           // VAD 后端：Silero 模型缺失时会自动降级能量 VAD，
           // 用户需要知道「为什么音频切分效果不如预期」。
           if (service.vadBackendNote != null)
             _buildStatusRow('VAD 后端', service.vadBackendNote!),
-          _buildStatusRow('语言方向', '${service.mtSourceLang} → ${service.mtTargetLang}'),
+          _buildStatusRow(
+            '语言方向',
+            '${service.mtSourceLang} → ${service.mtTargetLang}',
+          ),
           // 悬浮窗状态：窗口没弹出来时这里会显示具体原因（权限被拒 /
           // 服务启动失败），用户不必去翻 logcat 才知道发生了什么。
           _buildStatusRow(
             '悬浮窗',
-            service.isOverlayVisible
-                ? '已显示'
-                : (service.overlayNote ?? '未显示'),
+            service.isOverlayVisible ? '已显示' : (service.overlayNote ?? '未显示'),
             valueColor: service.isOverlayVisible
                 ? Colors.greenAccent
-                : (service.overlayNote != null ? Colors.orangeAccent : Colors.grey),
+                : (service.overlayNote != null
+                      ? Colors.orangeAccent
+                      : Colors.grey),
           ),
           // 服务在跑但窗口没出来 → 给一个直接补上的入口
           if (service.isServiceRunning && !service.isOverlayVisible)
@@ -492,8 +521,12 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           if (service.engineNote != null)
             _buildStatusRow('引擎说明', service.engineNote!),
           if (service.lastError != null)
-            _buildStatusRow('最后错误', service.lastError!, 
-                valueColor: Colors.redAccent, isError: true),
+            _buildStatusRow(
+              '最后错误',
+              service.lastError!,
+              valueColor: Colors.redAccent,
+              isError: true,
+            ),
           const SizedBox(height: 8),
           _buildOverlaySettingsRow(context, service),
         ],
@@ -589,10 +622,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               Icon(icon, size: 14, color: color),
               if (label != null) ...[
                 const SizedBox(width: 4),
-                Text(
-                  label,
-                  style: TextStyle(color: color, fontSize: 11),
-                ),
+                Text(label, style: TextStyle(color: color, fontSize: 11)),
               ],
             ],
           ),
@@ -600,8 +630,13 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
-  Widget _buildStatusRow(String label, String value, {Color? valueColor, bool isError = false}) {
+
+  Widget _buildStatusRow(
+    String label,
+    String value, {
+    Color? valueColor,
+    bool isError = false,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Row(
@@ -609,10 +644,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           Expanded(
             child: Text(
               label,
-              style: TextStyle(
-                color: Colors.grey[500],
-                fontSize: 14,
-              ),
+              style: TextStyle(color: Colors.grey[500], fontSize: 14),
             ),
           ),
           const SizedBox(width: 12),
@@ -633,7 +665,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
+
   /// 语言设置卡片
   ///
   /// 三项选择共同决定「听到什么语言 → 翻译成什么语言」：
@@ -655,50 +687,40 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           // ASR 语言选择
           _buildDropdownSetting(
             label: '识别语言 (ASR)',
-            hint: '告诉语音识别引擎：音频里说的是哪种语言。'
+            hint:
+                '告诉语音识别引擎：音频里说的是哪种语言。'
                 '选错会直接导致识别结果是乱码或无输出。',
             value: service.asrLanguage,
-            items: const [
-              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
-              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
-              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
-              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
-            ],
+            items: _languageItems(),
             onChanged: (value) => service.setASRLanguage(value!),
           ),
-          
+
           const Divider(color: Colors.white10, height: 24),
-          
+
           // MT 源语言
           _buildDropdownSetting(
             label: '源语言 (MT)',
-            hint: '告诉翻译引擎：它拿到的文本原本是什么语言。'
+            hint:
+                '告诉翻译引擎：它拿到的文本原本是什么语言。'
                 '通常应与上面的识别语言保持一致，不一致会造成「中文再翻成中文」。',
             value: service.mtSourceLang,
-            items: const [
-              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
-              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
-              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
-              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
-            ],
-            onChanged: (value) => service.setMTLanguagePair(value!, service.mtTargetLang),
+            items: _languageItems(excludeCode: service.mtTargetLang),
+            onChanged: (value) =>
+                service.setMTLanguagePair(value!, service.mtTargetLang),
           ),
-          
+
           const Divider(color: Colors.white10, height: 24),
-          
+
           // MT 目标语言
           _buildDropdownSetting(
             label: '目标语言 (MT)',
-            hint: '告诉翻译引擎：要把文本翻译成哪种语言。'
+            hint:
+                '告诉翻译引擎：要把文本翻译成哪种语言。'
                 '字幕与悬浮窗显示的就是这个语言的结果。',
             value: service.mtTargetLang,
-            items: const [
-              DropdownMenuItem(value: 'ja', child: Text('日语 (日本語)')),
-              DropdownMenuItem(value: 'en', child: Text('英语 (English)')),
-              DropdownMenuItem(value: 'zh', child: Text('中文 (中文)')),
-              DropdownMenuItem(value: 'ko', child: Text('韩语 (한국어)')),
-            ],
-            onChanged: (value) => service.setMTLanguagePair(service.mtSourceLang, value!),
+            items: _languageItems(excludeCode: service.mtSourceLang),
+            onChanged: (value) =>
+                service.setMTLanguagePair(service.mtSourceLang, value!),
           ),
         ],
       ),
@@ -725,7 +747,36 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ],
     );
   }
-  
+
+  /// 语言下拉框条目（三个选择器共用）
+  ///
+  /// v0.7.0 起从 [LanguageRegistry] 生成，不再各自硬编码 `en/ja/zh/ko`。
+  /// 旧实现只有 4 种语言，而模型清单已经扩到 12 种 —— 用户下载了
+  /// 法语 / 德语 / 西班牙语 / 俄语模型，界面上却**根本选不到**，
+  /// 等于白下几百 MB。
+  ///
+  /// [excludeCode]：要从列表里剔除的语言代码。
+  ///
+  /// 源语言与目标语言永远不能相同（`LanguageRegistry.mtPairs` 不包含
+  /// 自我翻译方向），所以两个下拉框必须互斥 —— 选源语言时把当前目标语言
+  /// 剔掉，反之亦然。不做互斥的话，用户随手就能选出 `en → en`，
+  /// 而 `switchLanguagePair` 会抛 `ArgumentError`（调用方没 try/catch，
+  /// 直接变成未捕获异步异常 + 界面卡在上一个状态）。
+  ///
+  /// `const` 不能加：`LanguageRegistry.all` 虽然是 `const` 列表，
+  /// 但这里要 `map` 成 widget，生成的必然是运行期列表。
+  static List<DropdownMenuItem<String>> _languageItems({String? excludeCode}) {
+    return LanguageRegistry.all
+        .where((language) => language.code != excludeCode)
+        .map(
+          (language) => DropdownMenuItem<String>(
+            value: language.code,
+            child: Text(language.displayLabel),
+          ),
+        )
+        .toList(growable: false);
+  }
+
   Widget _buildDropdownSetting({
     required String label,
     required String value,
@@ -770,7 +821,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               isExpanded: true,
               dropdownColor: const Color(0xFF2A2A2A),
               style: const TextStyle(color: Colors.white, fontSize: 15),
-              icon: Icon(Icons.keyboard_arrow_down_rounded, color: Colors.grey[400]),
+              icon: Icon(
+                Icons.keyboard_arrow_down_rounded,
+                color: Colors.grey[400],
+              ),
               items: items,
               onChanged: onChanged,
               borderRadius: BorderRadius.circular(12),
@@ -780,7 +834,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ],
     );
   }
-  
+
   /// 引擎选择卡片
   ///
   /// 这里的选项是「用哪套实现来做识别 / 翻译」，
@@ -820,9 +874,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             },
             onChanged: (engineId) => service.switchASREngine(engineId),
           ),
-          
+
           const Divider(color: Colors.white10, height: 24),
-          
+
           // MT 引擎选择
           _buildEngineSelector(
             label: 'MT 引擎',
@@ -838,7 +892,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
+
   Widget _buildEngineSelector({
     required String label,
     required String? currentEngine,
@@ -903,9 +957,12 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ],
     );
   }
-  
+
   /// 字幕历史卡片
-  Widget _buildSubtitleHistoryCard(BuildContext context, TranslationService service) {
+  Widget _buildSubtitleHistoryCard(
+    BuildContext context,
+    TranslationService service,
+  ) {
     return _buildCard(
       title: '字幕历史 (${service.subtitleBuffer.length})',
       icon: Icons.history_rounded,
@@ -926,7 +983,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 padding: const EdgeInsets.symmetric(vertical: 32),
                 child: Column(
                   children: [
-                    Icon(Icons.subtitles_rounded, size: 48, color: Colors.grey[800]),
+                    Icon(
+                      Icons.subtitles_rounded,
+                      size: 48,
+                      color: Colors.grey[800],
+                    ),
                     const SizedBox(height: 12),
                     Text(
                       '暂无字幕记录',
@@ -945,7 +1006,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
               itemCount: service.subtitleBuffer.length.clamp(0, 20),
-              separatorBuilder: (_, _) => const Divider(color: Colors.white10, height: 1),
+              separatorBuilder: (_, _) =>
+                  const Divider(color: Colors.white10, height: 1),
               itemBuilder: (context, index) {
                 final entry = service.subtitleBuffer[index];
                 return _buildSubtitleTile(entry);
@@ -953,7 +1015,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             ),
     );
   }
-  
+
   Widget _buildSubtitleTile(SubtitleEntry entry) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -965,13 +1027,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
-                  color: entry.isFinal ? Colors.green.withValues(alpha: 0.2) : Colors.orange.withValues(alpha: 0.2),
+                  color: entry.isFinal
+                      ? Colors.green.withValues(alpha: 0.2)
+                      : Colors.orange.withValues(alpha: 0.2),
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
                   '${entry.sourceLang}→${entry.targetLang}',
                   style: TextStyle(
-                    color: entry.isFinal ? Colors.greenAccent : Colors.orangeAccent,
+                    color: entry.isFinal
+                        ? Colors.greenAccent
+                        : Colors.orangeAccent,
                     fontSize: 10,
                     fontWeight: FontWeight.w600,
                   ),
@@ -989,7 +1055,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   height: 12,
                   child: CircularProgressIndicator(
                     strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.orangeAccent),
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      Colors.orangeAccent,
+                    ),
                   ),
                 ),
               ],
@@ -1021,7 +1089,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       ),
     );
   }
-  
+
   /// 通用卡片构建器
   Widget _buildCard({
     required String title,

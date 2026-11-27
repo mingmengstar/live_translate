@@ -23,8 +23,8 @@ import 'dart:developer';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:live_translate/core/i18n/language_registry.dart';
 import 'package:live_translate/core/model/model_storage.dart';
-
 import 'asr_engine.dart';
 import 'sherpa_asr_worker.dart';
 
@@ -51,18 +51,12 @@ class SherpaASREngine implements ASREngine {
   /// 模型本身是多语种联合训练的，这里列的是「可以切」的语言代码。
   /// 注意：单套 zipformer 模型不能真的切语种，切换只是记录意图，
   /// 真正换语种需要下载对应语言包（见 `ModelCatalog.asrFilesFor`）。
+  ///
+  /// v0.7.0 起从 [LanguageRegistry] 派生，不再本地硬编码。
+  /// 旧实现只列了 9 种、漏掉 `fr/de/es`，导致用户下载法语模型后
+  /// 一旦切到 `fr` 就在这里抛 `ArgumentError`（而调用方没有 try/catch）。
   @override
-  final List<String> supportedLanguages = [
-    'en',
-    'zh',
-    'ja',
-    'ko',
-    'ru',
-    'th',
-    'vi',
-    'ar',
-    'id',
-  ];
+  final List<String> supportedLanguages = LanguageRegistry.asrLanguages;
 
   // ---------------------------------------------------------------------------
   // Isolate 基础设施
@@ -119,13 +113,17 @@ class SherpaASREngine implements ASREngine {
     currentLanguage = language;
 
     // 1) 解析四件套路径（允许 config 显式覆盖，便于测试 / 指定语言包）
-    _encoderPath = (config['encoderPath'] as String?) ??
+    _encoderPath =
+        (config['encoderPath'] as String?) ??
         await ModelStorage.instance.resolveFileForRole('encoder');
-    _decoderPath = (config['decoderPath'] as String?) ??
+    _decoderPath =
+        (config['decoderPath'] as String?) ??
         await ModelStorage.instance.resolveFileForRole('decoder');
-    _joinerPath = (config['joinerPath'] as String?) ??
+    _joinerPath =
+        (config['joinerPath'] as String?) ??
         await ModelStorage.instance.resolveFileForRole('joiner');
-    _tokensPath = (config['tokensPath'] as String?) ??
+    _tokensPath =
+        (config['tokensPath'] as String?) ??
         await ModelStorage.instance.resolveFileForRole('tokens');
 
     final missing = <String>[
@@ -287,10 +285,7 @@ class SherpaASREngine implements ASREngine {
         // 忽略
       }
     }
-    log(
-      '[SherpaASR] 停止识别（累计投递 $_pushedBytes 字节）',
-      name: 'SherpaASR',
-    );
+    log('[SherpaASR] 停止识别（累计投递 $_pushedBytes 字节）', name: 'SherpaASR');
   }
 
   /// 推送 PCM16 单声道 16kHz 音频
@@ -324,10 +319,7 @@ class SherpaASREngine implements ASREngine {
       throw ArgumentError('不支持的语言: $language');
     }
     currentLanguage = language;
-    log(
-      '[SherpaASR] 语言标记切换为 $language（需重新加载对应语言包才真正生效）',
-      name: 'SherpaASR',
-    );
+    log('[SherpaASR] 语言标记切换为 $language（需重新加载对应语言包才真正生效）', name: 'SherpaASR');
   }
 
   @override

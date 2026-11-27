@@ -4,32 +4,34 @@ library live_translate.core.engine.mock_asr;
 
 import 'dart:async';
 import 'dart:developer';
+import 'package:live_translate/core/i18n/language_registry.dart';
+
 import 'asr_engine.dart';
 
 class MockASR implements ASREngine {
   @override
   final String engineId = 'mock_asr';
-  
+
   @override
   final String displayName = 'Mock ASR (测试用)';
-  
+
   @override
   bool isInitialized = false;
-  
+
   @override
   bool isRunning = false;
-  
+
   @override
   String currentLanguage = 'en';
-  
+
   @override
-  final List<String> supportedLanguages = ['en', 'ja', 'zh', 'ko'];
-  
+  final List<String> supportedLanguages = LanguageRegistry.asrLanguages;
+
   // 内部状态
   Timer? _timer;
   int _counter = 0;
   Function(ASRResult)? _onResult;
-  
+
   // Mock 文本数据池（英文和日文混合）
   static final List<String> _mockTextsEn = [
     'Hello, this is a test.',
@@ -41,7 +43,7 @@ class MockASR implements ASREngine {
     'Voice recognition in progress.',
     'System audio capture active.',
   ];
-  
+
   static final List<String> _mockTextsJa = [
     'こんにちは、これはテストです。',
     '今日は天気がいいですね。',
@@ -52,7 +54,7 @@ class MockASR implements ASREngine {
     '音声認識が進行中です。',
     'システムオーディオキャプチャがアクティブです。',
   ];
-  
+
   static final List<String> _mockTextsZh = [
     '你好，这是一个测试。',
     '今天天气真不错。',
@@ -63,7 +65,7 @@ class MockASR implements ASREngine {
     '语音识别进行中。',
     '系统音频捕获已激活。',
   ];
-  
+
   @override
   Future<void> initialize({
     String? modelPath,
@@ -72,12 +74,12 @@ class MockASR implements ASREngine {
   }) async {
     // 模拟初始化延迟
     await Future.delayed(const Duration(milliseconds: 300));
-    
+
     currentLanguage = language;
     isInitialized = true;
     log('[MockASR] Initialized with language: $language', name: 'MockASR');
   }
-  
+
   @override
   Future<void> start({
     required Function(ASRResult) onResult,
@@ -86,65 +88,69 @@ class MockASR implements ASREngine {
     if (!isInitialized) {
       throw StateError('MockASR not initialized');
     }
-    
+
     if (isRunning) {
       return;
     }
-    
+
     _onResult = onResult;
     // _onError = onError; // Mock 不需要错误回调
     isRunning = true;
     _counter = 0;
-    
+
     log('[MockASR] Started', name: 'MockASR');
-    
+
     // 启动定时器，每 2-4 秒产生一个结果
     _timer = Timer.periodic(const Duration(seconds: 3), _generateMockResult);
-    
+
     // 立即产生第一个结果
     _generateMockResult(_timer!);
   }
-  
+
   void _generateMockResult(Timer timer) {
     if (!isRunning || _onResult == null) {
       timer.cancel();
       return;
     }
-    
+
     _counter++;
-    
+
     // 根据当前语言选择文本池
     final texts = switch (currentLanguage) {
       'ja' => _mockTextsJa,
       'zh' => _mockTextsZh,
       _ => _mockTextsEn,
     };
-    
+
     final text = texts[_counter % texts.length];
     final isFinal = _counter % 3 == 0; // 每3个结果有一个是最终结果
-    
+
     // 模拟流式输出：先给部分结果，再给最终结果
     if (!isFinal && _counter % 3 != 1) {
       // 中间片段
-      _onResult!(ASRResult(
-        text: text.substring(0, (text.length * 0.6).round()),
-        isFinal: false,
-        confidence: 0.85,
+      _onResult!(
+        ASRResult(
+          text: text.substring(0, (text.length * 0.6).round()),
+          isFinal: false,
+          confidence: 0.85,
+          timestamp: Duration(seconds: _counter * 3),
+          language: currentLanguage,
+        ),
+      );
+    }
+
+    // 最终结果
+    _onResult!(
+      ASRResult(
+        text: text,
+        isFinal: true,
+        confidence: 0.95,
         timestamp: Duration(seconds: _counter * 3),
         language: currentLanguage,
-      ));
-    }
-    
-    // 最终结果
-    _onResult!(ASRResult(
-      text: text,
-      isFinal: true,
-      confidence: 0.95,
-      timestamp: Duration(seconds: _counter * 3),
-      language: currentLanguage,
-    ));
+      ),
+    );
   }
-  
+
   @override
   Future<void> stop() async {
     isRunning = false;
@@ -154,7 +160,7 @@ class MockASR implements ASREngine {
     // _onError = null; // Mock 不需要错误回调
     log('[MockASR] Stopped', name: 'MockASR');
   }
-  
+
   @override
   Future<void> pushAudio(List<int> audioData) async {
     // Mock 引擎不需要实际处理音频，只需确保在运行状态
@@ -162,7 +168,7 @@ class MockASR implements ASREngine {
       log('[MockASR] pushAudio called but not running', name: 'MockASR');
     }
   }
-  
+
   @override
   Future<void> switchLanguage(String language) async {
     if (!supportedLanguages.contains(language)) {
@@ -171,14 +177,14 @@ class MockASR implements ASREngine {
     currentLanguage = language;
     log('[MockASR] Language switched to: $language', name: 'MockASR');
   }
-  
+
   @override
   Future<void> dispose() async {
     await stop();
     isInitialized = false;
     log('[MockASR] Disposed', name: 'MockASR');
   }
-  
+
   @override
   Map<String, dynamic> getStatus() {
     return {

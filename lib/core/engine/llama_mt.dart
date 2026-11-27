@@ -47,7 +47,9 @@ import 'dart:developer';
 import 'dart:io' show Platform;
 
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
-import 'package:live_translate/core/model/model_catalog.dart' show MtPromptStyle;
+import 'package:live_translate/core/i18n/language_registry.dart';
+import 'package:live_translate/core/model/model_catalog.dart'
+    show MtPromptStyle;
 import 'package:live_translate/core/model/model_storage.dart';
 
 import 'mt_engine.dart';
@@ -75,37 +77,23 @@ class LlamaMTEngine implements MTEngine {
   @override
   String targetLanguage = 'ja';
 
-  /// Hy-MT1.5 官方支持的语种（中英日韩等），这里列常用子集。
-  @override
-  final List<LanguagePair> supportedLanguagePairs = const [
-    LanguagePair(source: 'en', target: 'ja', displayName: 'English → Japanese'),
-    LanguagePair(source: 'en', target: 'zh', displayName: 'English → Chinese'),
-    LanguagePair(source: 'en', target: 'ko', displayName: 'English → Korean'),
-    LanguagePair(source: 'ja', target: 'en', displayName: 'Japanese → English'),
-    LanguagePair(source: 'ja', target: 'zh', displayName: 'Japanese → Chinese'),
-    LanguagePair(source: 'zh', target: 'en', displayName: 'Chinese → English'),
-    LanguagePair(source: 'zh', target: 'ja', displayName: 'Chinese → Japanese'),
-    LanguagePair(source: 'zh', target: 'ko', displayName: 'Chinese → Korean'),
-    LanguagePair(source: 'ko', target: 'en', displayName: 'Korean → English'),
-    LanguagePair(source: 'ko', target: 'zh', displayName: 'Korean → Chinese'),
-    LanguagePair(source: 'ko', target: 'ja', displayName: 'Korean → Japanese'),
-  ];
-
-  /// 语言代码 → 官方 prompt 里的自然语言名
+  /// 支持的语言对
   ///
-  /// Hy-MT1.5 的指令模板要写全称（`Japanese` 而非 `ja`），
-  /// 写代码会让模型输出不稳定。
-  static const Map<String, String> _languageNames = {
-    'en': 'English',
-    'zh': 'Chinese',
-    'ja': 'Japanese',
-    'ko': 'Korean',
-    'ru': 'Russian',
-    'th': 'Thai',
-    'vi': 'Vietnamese',
-    'ar': 'Arabic',
-    'id': 'Indonesian',
-  };
+  /// v0.7.0 起从 [LanguageRegistry.mtPairs] 派生（12 种语言 × 11 = 132 个方向）。
+  ///
+  /// 旧实现硬编码了 11 个方向，`en→ru`、`ja→fr` 这类完全合理的组合会直接
+  /// 抛 `ArgumentError`——而 `switchLanguagePair` 的调用方
+  /// `TranslationService.setMTLanguagePair` 没有 try/catch，
+  /// 结果就是**未捕获异步异常**。Hy-MT1.5 / Qwen2.5 都是指令式多语模型，
+  /// 语种只写在 prompt 里，不存在「只支持这 11 个方向」的物理限制。
+  @override
+  final List<LanguagePair> supportedLanguagePairs = LanguageRegistry.mtPairs;
+
+  // 语言代码 → prompt 里的自然语言名，统一走 [LanguageRegistry.mtPromptName]。
+  //
+  // Hy-MT1.5 的指令模板要写全称（`Japanese` 而非 `ja`），写代码会让模型
+  // 输出不稳定。v0.7.0 起不再本地维护一份只有 9 种语言、缺 `fr/de/es`
+  // 的映射表（缺的语言会原样把语言代码拼进 prompt）。
 
   // ---------------------------------------------------------------------------
   // 运行期状态
@@ -196,7 +184,8 @@ class LlamaMTEngine implements MTEngine {
     };
 
     // 1) 解析权重路径（允许 config 覆盖，便于测试 / 指定其他 GGUF）
-    _modelPath = (config['modelPath'] as String?) ??
+    _modelPath =
+        (config['modelPath'] as String?) ??
         (modelPath != null && modelPath.trim().isNotEmpty
             ? modelPath.trim()
             : await ModelStorage.instance.resolveMtModelPath());
@@ -226,7 +215,8 @@ class LlamaMTEngine implements MTEngine {
     //
     // 翻译不是创作，高温会让同一句话每次译得不一样，
     // 甚至凭空添加原文没有的内容。
-    _maxTokens = (config['maxTokens'] as num?)?.toInt() ??
+    _maxTokens =
+        (config['maxTokens'] as num?)?.toInt() ??
         // 兼容旧配置键（0.2.x 时代叫 nPredict，在 ContextParams 上）
         (config['nPredict'] as num?)?.toInt() ??
         256;
@@ -252,14 +242,15 @@ class LlamaMTEngine implements MTEngine {
     );
 
     try {
-      _engine = await LlamaEngine.spawn(
-        modelParams: modelParams,
-        contextParams: contextParams,
-      ).timeout(
-        // 1.8B Q4 在低端机上冷加载可能很慢，但无限等会让 UI 永远转圈
-        const Duration(seconds: 90),
-        onTimeout: () => throw TimeoutException('翻译模型加载超时（90s）'),
-      );
+      _engine =
+          await LlamaEngine.spawn(
+            modelParams: modelParams,
+            contextParams: contextParams,
+          ).timeout(
+            // 1.8B Q4 在低端机上冷加载可能很慢，但无限等会让 UI 永远转圈
+            const Duration(seconds: 90),
+            onTimeout: () => throw TimeoutException('翻译模型加载超时（90s）'),
+          );
 
       _session = await _engine!.createSession();
 
@@ -289,7 +280,8 @@ class LlamaMTEngine implements MTEngine {
   /// libllama.so`，这在不同 ABI 的 APK 上必然出现（上游 AAR 只带 arm64）。
   String _describeLoadFailure(Object e) {
     final text = e.toString();
-    final looksLikeMissingNative = text.contains('libllama.so') ||
+    final looksLikeMissingNative =
+        text.contains('libllama.so') ||
         text.contains('libmtmd.so') ||
         text.contains('failed to open') ||
         text.contains('DynamicLibrary');
@@ -319,7 +311,9 @@ class LlamaMTEngine implements MTEngine {
   /// 混元系列用上面的专用模板。用错模板不会报错，只会「输出原文/乱码」，
   /// 属于最难排查的一类问题，所以模板由 [MtModelSpec] 显式指定。
   String _buildPrompt(String text, String targetLang) {
-    final targetName = _languageNames[targetLang] ?? targetLang;
+    // 未知语言代码原样返回（而非抛异常）：宁可译得差一点，
+    // 也不能让整条翻译链路因为一个语种代码断掉。
+    final targetName = LanguageRegistry.mtPromptName(targetLang);
     switch (_promptStyle) {
       case MtPromptStyle.chatMl:
         return '<|im_start|>system\n'
@@ -483,22 +477,14 @@ class LlamaMTEngine implements MTEngine {
   /// Hy-MT1.5 是「指令式」翻译模型，语种写在 prompt 里，
   /// 不需要重新加载权重，只改字段即可。
   @override
-  Future<void> switchLanguagePair(
-    String sourceLang,
-    String targetLang,
-  ) async {
+  Future<void> switchLanguagePair(String sourceLang, String targetLang) async {
     final pair = supportedLanguagePairs.firstWhere(
       (p) => p.source == sourceLang && p.target == targetLang,
-      orElse: () => throw ArgumentError(
-        '不支持的语言对: $sourceLang -> $targetLang',
-      ),
+      orElse: () => throw ArgumentError('不支持的语言对: $sourceLang -> $targetLang'),
     );
     sourceLanguage = pair.source;
     targetLanguage = pair.target;
-    log(
-      '[LlamaMT] 语言对切换为 $sourceLanguage -> $targetLanguage',
-      name: 'LlamaMT',
-    );
+    log('[LlamaMT] 语言对切换为 $sourceLanguage -> $targetLanguage', name: 'LlamaMT');
   }
 
   /// 中断当前生成（新请求进来时先调，避免串台）
