@@ -124,6 +124,73 @@ void main() {
     });
   });
 
+  group('悬浮窗 Dart 入口点必须进 AOT 快照', () {
+    // 事故复现（v0.3.4）：
+    // flutter_screen_overlay 原生侧用
+    //   new DartEntrypoint(bundlePath, "overlayMain")
+    // 按**名字**去 AOT 快照里找入口点。但 overlay_screen.dart 当时
+    // 全项目零 import，Dart 编译器按 import 图决定编译单元，于是整份
+    // 文件没被编译 —— libapp.so 里连它的字符串常量都不存在。
+    // 后果：APK 构建成功、单测全过、OverlayService 也起来了，
+    // 但悬浮窗口里永远是白屏。行为测试抓不到，只能做源码断言。
+    late String mainDart;
+    late String overlayScreen;
+
+    setUpAll(() {
+      mainDart = stripDartComments(
+        File('lib/main.dart').readAsStringSync(),
+      );
+      overlayScreen = stripDartComments(
+        File('lib/ui/overlay_screen.dart').readAsStringSync(),
+      );
+    });
+
+    test('main.dart 必须 import overlay_screen.dart（否则文件不进编译图）', () {
+      expect(
+        mainDart.contains("import 'package:live_translate/ui/overlay_screen.dart'"),
+        true,
+        reason: '没有这条 import，overlay_screen.dart 完全不参与编译，'
+            'release APK 里不会有 overlayMain',
+      );
+    });
+
+    test('main.dart 必须以真实引用持有 overlayMain（不能只在注释里提到）', () {
+      expect(
+        mainDart.contains('overlayMain'),
+        true,
+        reason: '仅 import 不引用，入口点仍可能被 tree-shake',
+      );
+    });
+
+    test('保留 overlayMain 的引用不能放在 assert 里', () {
+      // assert 在 release 构建会被整体剥离。若「防止 tree-shake」的引用
+      // 写在 assert 中，debug 下测试全绿，release APK 依然丢入口点。
+      final assertBlocks = RegExp(r'assert\s*\(\s*\(\)\s*\{[\s\S]*?\}\s*\(\s*\)\s*\)');
+      for (final m in assertBlocks.allMatches(mainDart)) {
+        expect(
+          m.group(0)!.contains('kEmbeddedEntrypoints'),
+          false,
+          reason: '入口点保留表不能在 assert 里被引用，release 会被剥离',
+        );
+      }
+    });
+
+    test('overlayMain 必须带 @pragma(vm:entry-point)', () {
+      expect(
+        overlayScreen.contains("@pragma('vm:entry-point')"),
+        true,
+        reason: '缺少 entry-point 注解，AOT 会把它当死代码删掉',
+      );
+      // 注解必须紧贴函数声明（中间只允许空白行）
+      expect(
+        RegExp(r"@pragma\('vm:entry-point'\)\s*\n\s*void\s+overlayMain\s*\(")
+            .hasMatch(overlayScreen),
+        true,
+        reason: '@pragma 必须直接修饰 overlayMain 函数',
+      );
+    });
+  });
+
   group('悬浮窗尺寸', () {
     test('字幕条不能用 matchParent 全屏（会挡住整屏触摸）', () {
       // showOverlay 的 height/width 直接进 WindowManager.LayoutParams，

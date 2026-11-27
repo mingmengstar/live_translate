@@ -4,10 +4,57 @@ import 'package:quick_settings_with_flutter_plugins/quick_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';
 import 'package:live_translate/core/tile/quick_settings_tile.dart';
 import 'package:live_translate/ui/home_screen.dart';
+// 悬浮窗入口所在文件。这个 import 不是「可选的整洁代码」——
+// 它是 release APK 里悬浮窗能不能显示的前提条件，删掉就等于悬浮窗消失。
+// 详见下面 kEmbeddedEntrypoints 的注释。
+import 'package:live_translate/ui/overlay_screen.dart' show overlayMain;
+
+/// 嵌入到本 App 内的「额外 Dart 入口点」保留表。
+///
+/// ## 为什么需要这个东西（踩过的 P0，勿删）
+///
+/// `flutter_screen_overlay` 的原生侧是这样启动悬浮窗 UI 的：
+///
+/// ```java
+/// new DartExecutor.DartEntrypoint(flutterLoader().findAppBundlePath(), "overlayMain")
+/// ```
+///
+/// 也就是说，它在**运行时按字符串名字**去 AOT 快照里找 `overlayMain`。
+///
+/// 而 Dart 的编译器（`dart compile aot`）是按 **import 图**决定编译单元的：
+/// 没有任何文件 import 的文件根本不参与编译，`@pragma('vm:entry-point')`
+/// 只是「不要因为看起来没人调用而把它当垃圾删掉」的保命符，它**不能**
+/// 把一份没进编译图的文件拉进来。
+///
+/// 历史事故（v0.3.4）：`overlay_screen.dart` 全项目零 import，
+/// 于是 `libapp.so` 里连它的字符串常量都不存在（用 `utf-16-le` 反查
+/// `[Overlay] Lifecycle state` 命中 0 次）。表现是：APK 构建成功、
+/// 单测全过、悬浮窗 Service 也起来了，但窗口里永远是空的 / 白屏。
+///
+/// 所以这里用两件事同时保证：
+/// 1. 文件头部的 `import ... overlay_screen.dart` → 让它进入编译图；
+/// 2. 下面的 const 表持有 `overlayMain` 的 tear-off，并在 `main()` 里被读取
+///    → 让 AOT 认为它是一个「可能被调用的活函数」，连同
+///    `OverlayApp` / `OverlayScreen` 整棵 widget 树一起保留下来。
+///
+/// 加新入口点（比如 widget/后台 isolate）时也往这个表里加。
+const List<void Function()> kEmbeddedEntrypoints = <void Function()>[
+  overlayMain,
+];
 
 void main() {
   // 确保 Flutter 绑定初始化
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 触碰一次上面那张表，防止它被当作未使用的常量整条 tree-shake 掉。
+  //
+  // 注意这里**不能用 `assert(...)`**：assert 在 release 构建里会被整体剥离，
+  // 那样「引用」就只在 debug 下存在，release APK 依然会丢掉这个入口点 ——
+  // 正是本项目这个 P0 的翻版。必须用一条 release 下也会执行的语句。
+  // debugPrint 在 release 中仍保留，顺带在 logcat 留一行可核对的痕迹。
+  debugPrint(
+    '[Entrypoints] embedded dart entrypoints: ${kEmbeddedEntrypoints.length}',
+  );
   
   // 设置 QuickSettings 回调（必须在 runApp 之前调用）
   QuickSettings.setup(
