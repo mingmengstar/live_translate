@@ -1,11 +1,19 @@
 allprojects {
     repositories {
+        // 官方源优先，国内镜像仅作兜底。
+        //
+        // 历史事故（Run 45951861007，tag v0.7.0-ci-test-17）：
+        // 此前阿里云镜像排在最前，它返回 502 后 Gradle 会把整个仓库标记为
+        // disabled，连带 org.glassfish.jaxb:jaxb-runtime 解析失败，构建中断。
+        // 单点故障不应排在关键路径上 —— CI 跑在海外，官方源才是最快最稳的。
+        google()
+        mavenCentral()
+
+        // 以下镜像只为国内开发环境加速（海外 CI 命中上面两条就不会走到这里）。
         maven("https://maven.aliyun.com/repository/google")
         maven("https://maven.aliyun.com/repository/central")
         maven("https://maven.aliyun.com/repository/public")
         maven("https://repo.huaweicloud.com/repository/maven/")
-        google()
-        mavenCentral()
     }
 }
 
