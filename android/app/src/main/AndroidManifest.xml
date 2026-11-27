@@ -2,6 +2,10 @@
     package="com.example.live_translate">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- 悬浮字幕窗口用：flutter_screen_overlay 的 OverlayService 在前台服务中
+         展示字幕条。Android 14+ 要求 specialUse 类型必须显式声明本权限，
+         否则 startForeground() 抛 SecurityException。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -42,12 +46,27 @@
             android:name="flutterEmbedding"
             android:value="2" />
         
-        <!-- 悬浮窗 Flutter Engine 服务 -->
+        <!-- 悬浮字幕窗口服务（flutter_screen_overlay 插件提供）
+             ⚠️ 该 Service 必须由宿主 App 声明：插件自己的 AndroidManifest.xml
+             里只有 3 个 permission，没有 <service>（见其 README "Declare the
+             overlay service"）。漏声明的后果是 FlutterOverlayWindowPlugin
+             的 startService() 直接抛异常 → showOverlay() 返回
+             PlatformException(SERVICE_START) → 悬浮窗永远不出现。
+
+             历史遗留：这里原本声明的是本项目的 OverlayFlutterEngine
+             （android:process=":overlay"），但它从未被任何代码 startService，
+             其 MethodChannel("live_translate/overlay") 在 lib/ 中零调用，
+             属于死代码；真正承载悬浮窗渲染的是插件这套（FlutterEngineCache
+             key = "myCachedEngine"）。已删除，避免两套引擎设计互相干扰。 -->
         <service
-            android:name=".OverlayFlutterEngine"
+            android:name="flutter.overlay.window.flutter_overlay_window.OverlayService"
             android:enabled="true"
             android:exported="false"
-            android:process=":overlay" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Displays live translated subtitles as an overlay above other apps" />
+        </service>
 
         <!-- 系统音频内录前台服务（自研，替代损坏的 system_audio_recorder）
              Android 14+ 必须声明 foregroundServiceType，否则启动即崩 -->

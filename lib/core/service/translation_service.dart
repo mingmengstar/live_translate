@@ -10,10 +10,12 @@ import 'package:flutter_screen_overlay/flutter_screen_overlay.dart';
 import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/audio/audio_capture_service.dart';
 import 'package:live_translate/core/model/model_storage.dart';
+import 'package:live_translate/core/overlay/overlay_controller.dart';
 
 class TranslationService extends ChangeNotifier {
   final EngineManager _engineManager = EngineManager();
   final AudioCaptureService _audioCapture = AudioCaptureService();
+  final OverlayController _overlay = OverlayController.instance;
   
   // 状态
   bool _isServiceRunning = false;
@@ -61,6 +63,15 @@ class TranslationService extends ChangeNotifier {
   ///
   /// 初始化前为 null；初始化后由 [AudioCaptureService.vadBackendNote] 填充。
   String? get vadBackendNote => _vadBackendNote;
+
+  /// 悬浮窗显示状态说明（失败时可直接展示给用户）
+  String? _overlayNote;
+
+  /// 悬浮窗是否已显示
+  bool get isOverlayVisible => _overlay.isShowing;
+
+  /// 悬浮窗状态说明（如「未获得悬浮窗权限」）
+  String? get overlayNote => _overlayNote;
 
   /// 引擎选择说明（为何当前是 Mock / 真实引擎，如「模型缺失（2/6），使用 Mock 引擎」）
   String? get engineNote => _engineNote;
@@ -199,6 +210,14 @@ class TranslationService extends ChangeNotifier {
 
     // 监听引擎变更
     _engineManager.addListener(_onEngineChanged);
+
+    // 预热悬浮窗引擎
+    //
+    // 冷启动 overlayMain 大约要 5s（插件文档也提到这一点），
+    // 如果等用户点「开始」才创建，会出现「点了开始、几秒后字幕条才冒出来」
+    // 的体感延迟。这里在 App 初始化阶段就建好引擎（此时用户还在首页），
+    // 点开始时是热的。失败不影响功能，warmUp() 内部已吞掉异常。
+    unawaited(_overlay.warmUp());
   }
 
   /// 音频段回调（来自 VAD）
@@ -264,17 +283,66 @@ class TranslationService extends ChangeNotifier {
       
       // 启动音频捕获
       await _audioCapture.start();
-      
+
       _isServiceRunning = true;
       _subtitleBuffer.clear();
+
+      // 显示悬浮字幕窗口
+      //
+      // 顺序很重要：必须放在「音频真的开始流」之后。
+      // 否则用户点了开始、但屏幕录制授权被拒（start() 已抛异常走到 catch），
+      // 悬浮窗却已经挂出来了 —— 屏幕上留一条永远「等待语音输入...」的黑条。
+      await _syncOverlayWithServiceState();
+
       _updateStatus('服务运行中...');
       notifyListeners();
     } catch (e, stack) {
       _lastError = '启动失败: $e';
       _updateStatus('启动失败');
       log('TranslationService start error: $e\n$stack', name: 'TranslationService');
+      // 启动失败时确保不会遗留一个假运行的悬浮窗
+      await _overlay.hide();
+      _overlayNote = null;
       notifyListeners();
     }
+  }
+
+  /// 把悬浮窗状态同步到「服务是否运行」
+  ///
+  /// 悬浮窗单独失败**不应该**让翻译服务失败：字幕条是展示层，
+  /// 音频与翻译是核心链路。所以这里只记录原因，不抛出。
+  Future<void> _syncOverlayWithServiceState() async {
+    if (!_isServiceRunning) {
+      await _overlay.hide();
+      _overlayNote = null;
+      return;
+    }
+
+    final result = await _overlay.show();
+    _overlayNote = result.ok ? null : result.reason;
+    if (!result.ok) {
+      log(
+        '[TranslationService] 悬浮窗未能显示: ${result.reason}',
+        name: 'TranslationService',
+      );
+    }
+  }
+
+  /// 手动重试显示悬浮窗（供 UI 的「悬浮窗未显示」提示条调用）
+  ///
+  /// 典型场景：用户点了开始，但悬浮窗权限此前被拒；
+  /// 去系统设置里授权后回到 App，点一下即可补上，不必停止再启动服务。
+  Future<OverlayShowResult> retryOverlay() async {
+    if (!_isServiceRunning) {
+      return const OverlayShowResult(
+        ok: false,
+        reason: '翻译服务未运行，悬浮窗无需显示',
+      );
+    }
+    final result = await _overlay.show();
+    _overlayNote = result.ok ? null : result.reason;
+    notifyListeners();
+    return result;
   }
   
   /// 停止翻译服务
@@ -284,6 +352,11 @@ class TranslationService extends ChangeNotifier {
     _updateStatus('正在停止服务...');
     
     try {
+      // 先关悬浮窗：停止过程中引擎会清空字幕，
+      // 若窗口还挂着会闪一下空的「等待语音输入...」再消失。
+      await _overlay.hide();
+      _overlayNote = null;
+
       await _engineManager.stopASR();
       
       // 停止音频捕获
@@ -503,6 +576,9 @@ class TranslationService extends ChangeNotifier {
   void dispose() {
     _debounceTimer?.cancel();
     _engineManager.removeListener(_onEngineChanged);
+    // 先同步关窗（不 await，dispose 是同步的），
+    // 避免 App 退出后系统里残留一条无主的悬浮字幕条。
+    unawaited(_overlay.hide());
     stopService();
     _engineManager.disposeAll();
     _audioCapture.dispose();

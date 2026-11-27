@@ -457,6 +457,36 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           if (service.vadBackendNote != null)
             _buildStatusRow('VAD 后端', service.vadBackendNote!),
           _buildStatusRow('语言方向', '${service.mtSourceLang} → ${service.mtTargetLang}'),
+          // 悬浮窗状态：窗口没弹出来时这里会显示具体原因（权限被拒 /
+          // 服务启动失败），用户不必去翻 logcat 才知道发生了什么。
+          _buildStatusRow(
+            '悬浮窗',
+            service.isOverlayVisible
+                ? '已显示'
+                : (service.overlayNote ?? '未显示'),
+            valueColor: service.isOverlayVisible
+                ? Colors.greenAccent
+                : (service.overlayNote != null ? Colors.orangeAccent : Colors.grey),
+          ),
+          // 服务在跑但窗口没出来 → 给一个直接补上的入口
+          if (service.isServiceRunning && !service.isOverlayVisible)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () async {
+                  final r = await service.retryOverlay();
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(r.ok ? '悬浮窗已显示' : '仍无法显示：${r.reason}'),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.fullscreen_rounded, size: 16),
+                label: const Text('重新显示', style: TextStyle(fontSize: 12)),
+                style: TextButton.styleFrom(foregroundColor: Colors.blue[300]),
+              ),
+            ),
           // 引擎选择原因：模型缺失 / 加载失败时会说明为何是 Mock，
           // 避免用户「下载了模型却还在跑 Mock」的困惑。
           if (service.engineNote != null)
