@@ -242,6 +242,17 @@ class _OverlayScreenState extends State<OverlayScreen>
     await _sendCommand(OverlayCommand.cycleOpacity);
   }
 
+  /// 循环背景色
+  ///
+  /// 与字号 / 透明度同一套路：先本地生效（立刻看到反馈），
+  /// 再通知主 App 持久化 + 广播。
+  Future<void> _cycleBackground() async {
+    final next = _settings.withNextBackground;
+    if (next == _settings) return;
+    setState(() => _settings = next);
+    await _sendCommand(OverlayCommand.cycleBackground);
+  }
+
   /// 切换双语字幕的上下顺序（原文在上 ↔ 译文在上）
   ///
   /// 与字号 / 透明度同一套路：先本地生效（立刻看到反馈），
@@ -280,53 +291,58 @@ class _OverlayScreenState extends State<OverlayScreen>
 
   @override
   Widget build(BuildContext context) {
+    final bg = _settings.backgroundColor;
+
+    // ## 为什么透明度不再套在整棵树上（v0.9.2）
+    //
+    // 旧实现是 `AnimatedOpacity(opacity: ...)` 包住整个 Container ——
+    // 背景和文字一起变透明。用户把透明度调到 0.6 想「少挡点视线」，
+    // 结果字也一起糊了，反而更看不清。
+    //
+    // 现在只让**背景色**带 alpha，文字 / 图标始终不透明：
+    // 于是「几乎全透明底 + 清晰白字」成为可达状态，这才是字幕该有的形态。
+    //
+    // 边框用完全不透明的前景色（而不是半透明白）：即使背景调到 0.25，
+    // 一圈清晰的描边也能让用户确认「窗口确实在屏幕上」——
+    // 这正是本次要解决的「起来了但看不见」。
+    final bgColor = bg.background.withValues(alpha: _settings.opacity);
+    final fg = bg.foreground;
+
     return Material(
       color: Colors.transparent,
-      child: AnimatedOpacity(
-        opacity: _settings.opacity,
-        duration: const Duration(milliseconds: 200),
-        child: Container(
-          decoration: BoxDecoration(
-            color: const Color(0xFF1E1E1E),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: _isFinal
-                  ? Colors.green.withValues(alpha: 0.5)
-                  : Colors.blue.withValues(alpha: 0.5),
-              width: 1.5,
+      child: Container(
+        decoration: BoxDecoration(
+          // 实心背景：第一判据。哪怕是纯黑内容上，配了边框也看得见。
+          color: bgColor,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: fg.withValues(alpha: 0.55),
+            width: 1.5,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.35),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
             ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.4),
-                blurRadius: 20,
-                offset: const Offset(0, 8),
-                spreadRadius: 2,
-              ),
-              BoxShadow(
-                color: (_isFinal ? Colors.green : Colors.blue)
-                    .withValues(alpha: 0.18),
-                blurRadius: 15,
-                spreadRadius: 2,
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildControlBar(fg),
+              // Expanded：窗口高度固定，内容区吃掉剩余空间；
+              // 文字过长时由 Text 的 maxLines + ellipsis 裁剪，
+              // 绝不能让 Column 溢出（溢出会在悬浮窗上画出黄黑条纹）。
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 6, 14, 10),
+                  child: _buildContent(fg),
+                ),
               ),
             ],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _buildControlBar(),
-                // Expanded：窗口高度固定，内容区吃掉剩余空间；
-                // 文字过长时由 Text 的 maxLines + ellipsis 裁剪，
-                // 绝不能让 Column 溢出（溢出会在悬浮窗上画出黄黑条纹）。
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(14, 4, 14, 10),
-                    child: _buildContent(),
-                  ),
-                ),
-              ],
-            ),
           ),
         ),
       ),
@@ -337,20 +353,64 @@ class _OverlayScreenState extends State<OverlayScreen>
   ///
   /// 上下顺序由 [OverlaySettings.order] 决定（原文在上 / 译文在上）。
   /// 两行都缺时显示空状态提示。
-  Widget _buildContent() {
+  ///
+  /// ## v0.9.2：空状态必须是「一眼可见」的
+  ///
+  /// 旧空状态是一行 `Colors.grey[500]` 的小字。半透明深灰底 + 中灰字，
+  /// 在深色内容背景上等于什么都没画 —— 用户据此判断「悬浮窗没显示」，
+  /// 于是把整条链路（权限 / 前台服务 / 引擎 / 挂载校验）全部怀疑一遍。
+  ///
+  /// 现在空状态本身就承担「这是一条字幕条」的视觉声明：
+  /// 大号图标 + 主信息 + 副信息，全部使用**当前预设的前景色**（不透明）。
+  Widget _buildContent(Color fg) {
     if (_sourceText.isEmpty && _translatedText.isEmpty) {
       return Center(
-        child: Row(
+        child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Icon(Icons.translate_rounded, size: 18, color: Colors.grey[600]),
-            const SizedBox(width: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _serviceRunning
+                      ? Icons.graphic_eq_rounded
+                      : Icons.pause_circle_outline_rounded,
+                  size: 22,
+                  color: fg,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    _serviceRunning ? '等待语音输入…' : '翻译服务未运行',
+                    // 字号跟随设置，但下限抬到 15：空状态是「窗口在不在」的
+                    // 判据，太小就失去意义。
+                    style: TextStyle(
+                      color: fg,
+                      fontSize: (_settings.fontSize < 15)
+                          ? 15
+                          : _settings.fontSize,
+                      fontWeight: FontWeight.w600,
+                      height: 1.3,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
             Text(
-              _serviceRunning ? '等待语音输入…' : '翻译服务未运行',
+              _serviceRunning
+                  ? '字幕条已就绪 · 播放任何声音就会出现在这里'
+                  : '到主界面点开始即可出字幕',
               style: TextStyle(
-                color: Colors.grey[500],
-                fontSize: _settings.fontSize * 0.85,
+                color: fg.withValues(alpha: 0.72),
+                fontSize: 11,
+                height: 1.4,
               ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
@@ -362,19 +422,24 @@ class _OverlayScreenState extends State<OverlayScreen>
         : _buildTextRow(
             label: '原文',
             text: _sourceText,
-            color: Colors.white.withValues(alpha: 0.9),
+            color: fg.withValues(alpha: 0.92),
             icon: Icons.mic_rounded,
             maxLines: 2,
+            accent: fg,
           );
 
+    // 译文用「提亮 + 加粗」而不是写死蓝色：
+    // 写死 `Colors.blue[100]` 在纯白 / 琥珀背景下几乎不可见。
     final targetRow = _translatedText.isEmpty
         ? null
         : _buildTextRow(
             label: '译文',
             text: _translatedText,
-            color: Colors.blue[100]!,
+            color: fg,
             icon: Icons.translate_rounded,
             maxLines: 2,
+            accent: fg,
+            emphasize: true,
           );
 
     // 按用户设置的顺序排列；只存在一行时不用加分隔间距
@@ -398,18 +463,26 @@ class _OverlayScreenState extends State<OverlayScreen>
   ///
   /// 按钮分两类，行为有本质区别：
   ///
-  /// - **本地可生效**：字号 ±、透明度、位置指示。
+  /// - **本地可生效**：字号 ±、背景不透明度、背景色、位置指示。
   ///   其中位置只是「显示当前在哪」，真正换位置要把命令发回主 App
   ///   重建窗口（`moveOverlay` 改的是像素偏移，不是 gravity）。
   /// - **必须回主 App 执行**：隐藏、停止。
   ///   overlay 自己 closeOverlay 会拆掉自己的引擎。
-  Widget _buildControlBar() {
+  ///
+  /// ## v0.9.2：按钮少了一个，但功能多了一个
+  ///
+  /// 去掉了单独的「切换上下顺序」以外的冗余项？没有 —— 只是把位置图标
+  /// 后面的空隙让给了新的「背景色」按钮。控制栏总宽必须塞进最窄的手机
+  /// （320dp - 两侧 24dp 边距 ≈ 296dp），所以每加一个按钮都要先算账：
+  /// 状态点 4 + 间隔 8 + 标题(min 40) + 7 个按钮 × 32 = 276dp，刚好放得下。
+  Widget _buildControlBar(Color fg) {
     return Container(
       height: 34,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.3),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+        // 用前景色的极低 alpha 叠一层，让控制栏在当前背景上始终可分辨
+        color: fg.withValues(alpha: 0.08),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
       ),
       child: Row(
         children: [
@@ -418,7 +491,7 @@ class _OverlayScreenState extends State<OverlayScreen>
             width: 18,
             height: 4,
             decoration: BoxDecoration(
-              color: _isFinal ? Colors.greenAccent : Colors.blue,
+              color: _isFinal ? Colors.greenAccent : _accentOnBg(fg),
               borderRadius: BorderRadius.circular(2),
             ),
           ),
@@ -427,7 +500,7 @@ class _OverlayScreenState extends State<OverlayScreen>
             child: Text(
               _isFinal ? '实时翻译' : '识别中…',
               style: TextStyle(
-                color: Colors.grey[400],
+                color: fg.withValues(alpha: 0.78),
                 fontSize: 11,
                 fontWeight: FontWeight.w500,
               ),
@@ -440,43 +513,70 @@ class _OverlayScreenState extends State<OverlayScreen>
             onTap: () => _changeFont(larger: false),
             tooltip: '减小字号',
             enabled: _settings.canDecreaseFont,
+            color: fg,
           ),
           _buildIconButton(
             icon: Icons.text_increase_rounded,
             onTap: () => _changeFont(larger: true),
             tooltip: '增大字号',
             enabled: _settings.canIncreaseFont,
+            color: fg,
           ),
           _buildIconButton(
             icon: Icons.opacity_rounded,
             onTap: _cycleOpacity,
-            tooltip: '调节透明度',
+            tooltip: '背景不透明度（当前 ${(_settings.opacity * 100).round()}%）',
+            color: fg,
+          ),
+          // 背景色：图标本身就用当前背景色填充，一眼看出点下去会变什么
+          _buildIconButton(
+            icon: Icons.palette_rounded,
+            onTap: _cycleBackground,
+            tooltip: '背景色（当前：${_settings.backgroundColor.label}）',
+            color: fg,
+            tint: _settings.backgroundColor.background,
           ),
           // 位置：图标即「当前在哪」，点一下换下一个位置
           _buildIconButton(
             icon: _positionIcon,
             onTap: _cyclePosition,
             tooltip: '切换位置（当前：${_settings.position.label}）',
+            color: fg,
           ),
           // 双语顺序：原文在上 / 译文在上
           _buildIconButton(
             icon: Icons.swap_vert_rounded,
             onTap: _toggleOrder,
             tooltip: '切换上下顺序（当前：${_settings.order.label}）',
+            color: fg,
           ),
           _buildIconButton(
             icon: Icons.visibility_off_rounded,
             onTap: _requestHide,
             tooltip: '收起悬浮窗（服务继续运行）',
+            color: fg,
           ),
           _buildIconButton(
             icon: Icons.stop_circle_outlined,
             onTap: _requestStop,
             tooltip: '停止翻译',
+            color: fg,
           ),
         ],
       ),
     );
+  }
+
+  /// 在当前前景色上挑一个「有辨识度的强调色」
+  ///
+  /// 深色背景配亮绿，亮色背景配深绿 —— 直接写死 `Colors.greenAccent`
+  /// 在白底上会变成几乎看不见的浅绿。
+  Color _accentOnBg(Color fg) {
+    // 判断前景亮还是暗（fg 是「配好的文字色」，所以亮前景 ⇒ 深背景）
+    final isLightFg = fg.computeLuminance() > 0.5;
+    return isLightFg
+        ? Colors.greenAccent.shade400
+        : Colors.green.shade800;
   }
 
   IconData get _positionIcon {
@@ -495,7 +595,12 @@ class _OverlayScreenState extends State<OverlayScreen>
     required VoidCallback onTap,
     required String tooltip,
     bool enabled = true,
+    Color? color,
+    /// 图标底色（用于「背景色」按钮直观展示当前颜色）
+    Color? tint,
   }) {
+    final base = color ?? Colors.grey[300]!;
+    final iconColor = enabled ? base : base.withValues(alpha: 0.3);
     return Tooltip(
       message: tooltip,
       child: InkWell(
@@ -504,10 +609,26 @@ class _OverlayScreenState extends State<OverlayScreen>
         child: SizedBox(
           width: 32,
           height: 32,
-          child: Icon(
-            icon,
-            size: 17,
-            color: enabled ? Colors.grey[300] : Colors.grey[700],
+          child: Center(
+            child: Container(
+              width: 18,
+              height: 18,
+              decoration: tint == null
+                  ? null
+                  : BoxDecoration(
+                      color: tint,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: iconColor.withValues(alpha: 0.8),
+                        width: 1,
+                      ),
+                    ),
+              child: Icon(
+                icon,
+                size: tint == null ? 17 : 12,
+                color: iconColor,
+              ),
+            ),
           ),
         ),
       ),
@@ -515,19 +636,28 @@ class _OverlayScreenState extends State<OverlayScreen>
   }
 
   /// 文本行（标签 + 内容）
+  ///
+  /// [emphasize] 为 true 时加粗 —— 用于译文，让「哪一行是要读的」一眼分明。
   Widget _buildTextRow({
     required String label,
     required String text,
     required Color color,
     required IconData icon,
     required int maxLines,
+    Color? accent,
+    bool emphasize = false,
   }) {
+    final accentColor = accent ?? color;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
           padding: const EdgeInsets.only(top: 2),
-          child: Icon(icon, size: 13, color: Colors.blue[300]),
+          child: Icon(
+            icon,
+            size: 13,
+            color: accentColor.withValues(alpha: 0.75),
+          ),
         ),
         const SizedBox(width: 7),
         Expanded(
@@ -537,7 +667,7 @@ class _OverlayScreenState extends State<OverlayScreen>
               Text(
                 label,
                 style: TextStyle(
-                  color: Colors.grey[500],
+                  color: accentColor.withValues(alpha: 0.6),
                   fontSize: _settings.fontSize * 0.65,
                   fontWeight: FontWeight.w500,
                 ),
@@ -548,7 +678,7 @@ class _OverlayScreenState extends State<OverlayScreen>
                   color: color,
                   fontSize: _settings.fontSize,
                   height: 1.35,
-                  fontWeight: FontWeight.w400,
+                  fontWeight: emphasize ? FontWeight.w600 : FontWeight.w400,
                 ),
                 maxLines: maxLines,
                 overflow: TextOverflow.ellipsis,

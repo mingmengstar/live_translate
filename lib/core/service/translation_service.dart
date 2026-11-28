@@ -70,8 +70,12 @@ class TranslationService extends ChangeNotifier {
   /// 已定稿句子的原文（用于「前文上下文」，最多 [maxContextSentences] 句）
   final List<String> _recentSources = [];
 
-  /// 前文上下文最多保留几句（模型卡建议 5 句）
-  static const int maxContextSentences = 5;
+  /// 前文上下文最多保留几句
+  ///
+  /// v0.9.2：5 → 3，与 `LlamaMTEngine.maxContextSentences` 保持一致。
+  /// 每轮翻译都要把整段 prompt 重新 prefill，句数直接乘在延迟上。
+  /// 详见 `LlamaMTEngine.maxContextSentences` 的注释。
+  static const int maxContextSentences = 3;
 
   /// 当前句是否已经定稿（定稿后不再接受新文本，直到下一句开始）
   bool _sentenceFinalized = false;
@@ -668,6 +672,12 @@ class TranslationService extends ChangeNotifier {
       case OverlayCommand.cycleOpacity:
         await _updateOverlaySettings(
           OverlaySettingsStore.instance.current.withNextOpacity,
+        );
+
+      case OverlayCommand.cycleBackground:
+        // 切换背景色预设。overlay 已先本地生效，这里负责持久化 + 广播正确值。
+        await _updateOverlaySettings(
+          OverlaySettingsStore.instance.current.withNextBackground,
         );
 
       case OverlayCommand.cyclePosition:
@@ -1388,7 +1398,31 @@ class TranslationService extends ChangeNotifier {
     notifyListeners();
   }
   
-  /// 调度防抖更新（100ms 节流，避免高频渲染崩溃）
+  /// 调度节流更新（**100ms 节流，不是防抖**）
+  ///
+  /// ## v0.9.2：从「防抖」改成真正的「节流」
+  ///
+  /// 旧实现每次调用都 `_debounceTimer?.cancel()` 再重开一个 100ms 计时器。
+  /// 这是**防抖（debounce）**语义 —— 等「安静 100ms」才触发。
+  ///
+  /// 而 MT 的 token 是连续到达的（密集时每 30~80ms 一个），于是：
+  ///
+  /// ```text
+  /// t=0    chunk1 → timer(100ms)
+  /// t=50   chunk2 → cancel + timer(100ms)   ← 永远等不到安静期
+  /// t=100  chunk3 → cancel + timer(100ms)
+  /// ...
+  /// t=800  生成结束 → 才终于安静下来 → 一次性刷出整句
+  /// ```
+  ///
+  /// 用户看到的正是「等半天，然后整句一下子蹦出来」，
+  /// 而不是「一个字一个字地出现」—— 这正是本轮要修的核心观感问题。
+  ///
+  /// 现在改成**真节流**：计时器已在跑就只更新待推送值，不重置计时器。
+  /// 保证「最多每 100ms 必刷一次」，且不丢最后一批内容：
+  /// 计时器回调里读的是待推送字段，所以最后一个 chunk 一定会被带上。
+  ///
+  /// 100ms（≈10 次/秒）仍是防崩红线要求的节流频率，勿调低。
   void _scheduleDebouncedUpdate({
     required String sourceText,
     required String translatedText,
@@ -1397,8 +1431,11 @@ class TranslationService extends ChangeNotifier {
     _pendingSourceText = sourceText;
     _pendingTranslatedText = translatedText;
     _pendingIsFinal = isFinal;
-    
-    _debounceTimer?.cancel();
+
+    // 已有在跑的节流窗口：只更新待推送值，**不重置**计时器。
+    // 这就是「节流」与「防抖」的唯一区别，也是本次修复的全部内容。
+    if (_debounceTimer?.isActive ?? false) return;
+
     _debounceTimer = Timer(const Duration(milliseconds: 100), () {
       _addSubtitleEntry(
         sourceText: _pendingSourceText,
@@ -1407,6 +1444,10 @@ class TranslationService extends ChangeNotifier {
       );
       // 通过 FlutterScreenOverlay.shareData() 发送给悬浮窗
       _sendToOverlay();
+      // 主界面「实时翻译」预览读的是 _currentTranslatedPartial，
+      // 只有 notifyListeners 才会重建。不在这里通知的话，
+      // 主界面的预览会比悬浮窗慢一整拍（甚至整句才更新）。
+      notifyListeners();
     });
   }
   

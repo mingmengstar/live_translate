@@ -47,26 +47,38 @@ void main() {
 
   group('OverlaySettings 透明度循环', () {
     test('按固定档位循环，且能绕回第一档', () {
-      // 从默认 0.95 开始连续点 4 次应该回到原点
+      // v0.9.2：档位改为 [0.25, 0.4, 0.6, 0.8, 1.0]，默认 1.0（不透明）。
+      // 从默认值连续点 5 次应该完整绕一圈回到原点。
       var s = const OverlaySettings();
+      expect(s.opacity, 1.0, reason: '默认必须是不透明，否则可能"看不见"');
+
       final seen = <double>[];
-      for (var i = 0; i < 4; i++) {
+      for (var i = 0; i < 5; i++) {
         s = s.withNextOpacity;
         seen.add(s.opacity);
       }
-      expect(seen, [1.0, 0.6, 0.8, 0.95]);
+      expect(seen, [0.25, 0.4, 0.6, 0.8, 1.0]);
+    });
+
+    test('档位必须包含 0.25 这种「几乎全透明」的极端值', () {
+      // 用户的核心诉求是「太挡视线了就再透明点」。
+      // 旧档位最低 0.6，在小屏上仍然盖住小半个屏幕，等于没得选。
+      expect(OverlaySettings.opacityLevels.first, 0.25);
+      expect(OverlaySettings.minOpacity, 0.25);
+      // 但不允许 0：全透明只剩边框，用户会以为是渲染 bug
+      expect(OverlaySettings.opacityLevels.any((v) => v <= 0.0), false);
     });
 
     test('当前值不在档位上时，取比它大的第一档', () {
-      // 模拟从持久化里读到 0.7（旧版本遗留 / 手改）
-      const s = OverlaySettings(opacity: 0.7);
-      expect(s.withNextOpacity.opacity, 0.8);
+      // 模拟从持久化里读到 0.5（旧版本遗留 / 手改）
+      const s = OverlaySettings(opacity: 0.5);
+      expect(s.withNextOpacity.opacity, 0.6);
     });
 
     test('当前值超过最大档时回到第一档', () {
       const s = OverlaySettings(opacity: 1.0);
-      // 1.0 是最后一档，下一个是 0.6
-      expect(s.withNextOpacity.opacity, 0.6);
+      // 1.0 是最后一档，下一个是 0.25
+      expect(s.withNextOpacity.opacity, 0.25);
     });
 
     test('透明度始终落在允许范围内', () {
@@ -76,6 +88,45 @@ void main() {
         expect(s.opacity, greaterThanOrEqualTo(OverlaySettings.minOpacity));
         expect(s.opacity, lessThanOrEqualTo(OverlaySettings.maxOpacity));
       }
+    });
+  });
+
+  group('SubtitleBgColor 背景预设', () {
+    test('每个预设的前景与背景必须有足够对比（防白底白字）', () {
+      for (final c in SubtitleBgColor.values) {
+        final bgLum = c.background.computeLuminance();
+        final fgLum = c.foreground.computeLuminance();
+        // 亮度差小于 0.4 的组合在手机上会明显发糊
+        expect(
+          (bgLum - fgLum).abs(),
+          greaterThan(0.4),
+          reason: '${c.label} 的前景/背景对比不足',
+        );
+      }
+    });
+
+    test('每个预设的 wire 值唯一且与枚举名解耦', () {
+      final wires = SubtitleBgColor.values.map((c) => c.wire).toList();
+      expect(wires.toSet().length, wires.length);
+      // 锁线上字符串：改名不能悄悄改协议
+      expect(SubtitleBgColor.midnight.wire, 'midnight');
+      expect(SubtitleBgColor.snow.wire, 'snow');
+    });
+
+    test('未知背景色退回默认而不是抛异常', () {
+      expect(SubtitleBgColor.fromWire('nonsense'), SubtitleBgColor.midnight);
+      expect(SubtitleBgColor.fromWire(null), SubtitleBgColor.midnight);
+    });
+
+    test('next 能完整循环一圈', () {
+      var c = SubtitleBgColor.midnight;
+      final seen = <SubtitleBgColor>[];
+      for (var i = 0; i < SubtitleBgColor.values.length; i++) {
+        seen.add(c);
+        c = c.next;
+      }
+      expect(c, SubtitleBgColor.midnight, reason: '循环一圈应回到起点');
+      expect(seen.length, SubtitleBgColor.values.length);
     });
   });
 
@@ -136,9 +187,12 @@ void main() {
         fontSize: 20,
         opacity: 0.8,
         position: SubtitlePosition.center,
+        backgroundColor: SubtitleBgColor.snow,
       );
       final round = OverlaySettings.fromMap(original.toMap());
       expect(round, original);
+      // 背景色必须真的往返，否则窗口重建后会跳回默认深色
+      expect(round.backgroundColor, SubtitleBgColor.snow);
     });
   });
 
@@ -174,6 +228,7 @@ void main() {
       expect(OverlayCommand.fontIncrease.wire, 'fontIncrease');
       expect(OverlayCommand.fontDecrease.wire, 'fontDecrease');
       expect(OverlayCommand.cycleOpacity.wire, 'cycleOpacity');
+      expect(OverlayCommand.cycleBackground.wire, 'cycleBackground');
       expect(OverlayCommand.cyclePosition.wire, 'cyclePosition');
       expect(OverlayCommand.requestSync.wire, 'requestSync');
     });

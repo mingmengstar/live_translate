@@ -136,9 +136,22 @@ class LlamaMTEngine implements MTEngine {
 
   /// 上下文里保留的前文句数上限
   ///
-  /// 模型卡建议「最多 5 句」：再多对译文质量的边际收益很小，
-  /// 却会让每次 prefill 变长，直接拖慢实时性。
-  static const int maxContextSentences = 5;
+  /// ## v0.9.2：从 5 句降到 3 句
+  ///
+  /// 模型卡建议「最多 5 句」，但那是**质量上限**，不是实时性上限。
+  ///
+  /// StreamRevise 每轮都要把完整 prompt 重新 prefill（模型是无状态的，
+  /// 每轮 `session.clear()` 后重传）。5 句原文在中文里约 100~150 字，
+  /// 加上背景说明、上一版原文、上一版译文，整段 prompt 可达 400+ 字 ≈
+  /// 300+ token。1.8B 模型在手机 4 线程上的 prefill 速度约
+  /// 100~200 token/s —— 光 prefill 就要 1.5~3 秒。
+  ///
+  /// 用户报的「翻译延迟比较长」主要就是这一段，**不是** decode 慢。
+  ///
+  /// 3 句仍然能给出跨句语境（代词指代、话题延续通常只需要前 1~2 句），
+  /// 但能把 prefill 直接砍掉约 40%。真正需要长上下文的场合极少，
+  /// 而「每句都多等 1 秒」是每句都付的代价。
+  static const int maxContextSentences = 3;
 
   @override
   String get engineId => kEngineId;

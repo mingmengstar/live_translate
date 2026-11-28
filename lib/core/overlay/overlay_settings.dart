@@ -19,6 +19,8 @@
 /// 用户下次开 App 还是上次的字号。
 library live_translate.core.overlay.overlay_settings;
 
+import 'dart:ui' show Color;
+
 import 'package:flutter_screen_overlay/flutter_screen_overlay.dart' as overlay;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -113,6 +115,74 @@ enum SubtitleOrder {
   }
 }
 
+/// 字幕条背景预设色（**背景与前景成对**，避免白底白字）
+///
+/// ## 为什么用固定预设而不是取色器
+///
+/// 1. 悬浮窗只有 34dp 高的控制栏，放不下取色器；
+/// 2. 真正需要的是「在白底 App 上要深色、在深色视频上要亮色」这种
+///    粗粒度切换，8 个预设已经够覆盖；
+/// 3. 固定枚举能保证 `wire` 稳定 —— 主 App 与 overlay 是两个独立引擎，
+///    颜色若按 `0xAARRGGBB` 裸整数传，两边解析格式不一致时
+///    **不会报错**，只会画出一个看不懂的颜色（本项目最怕的失败模式）。
+///
+/// 每个预设都自带配套前景色，所以「纯白背景 + 黑字」这种组合是内建保证的，
+/// 不需要调用方自己判断亮度。
+enum SubtitleBgColor {
+  /// 午夜黑（默认）：最不干扰的形态
+  midnight('午夜黑', 0xFF101418, 0xFFF2F6FA),
+
+  /// 石板灰
+  slate('石板灰', 0xFF2A2F36, 0xFFFFFFFF),
+
+  /// 纯白：最显眼，主要用于「先确认窗口到底出没出来」
+  snow('纯白', 0xFFF7FAFC, 0xFF101418),
+
+  /// 青色：深色内容上极度可见
+  cyan('青色', 0xFF00D9E8, 0xFF00202A),
+
+  /// 琥珀：暖色高对比
+  amber('琥珀', 0xFFFFC400, 0xFF201800),
+
+  /// 深蓝
+  navy('深蓝', 0xFF1B3B8F, 0xFFF2F6FA),
+
+  /// 深绿
+  forest('深绿', 0xFF0B5D3B, 0xFFF2F6FA),
+
+  /// 品红
+  magenta('品红', 0xFFB0136B, 0xFFF7FAFC);
+
+  const SubtitleBgColor(this.label, this._bgArgb, this._fgArgb);
+
+  /// 给用户看的中文名
+  final String label;
+
+  final int _bgArgb;
+  final int _fgArgb;
+
+  /// 背景色
+  Color get background => Color(_bgArgb);
+
+  /// 配套前景色（文字 / 图标 / 边框基准）
+  Color get foreground => Color(_fgArgb);
+
+  String get wire => name;
+
+  /// 下一档（循环）
+  SubtitleBgColor get next {
+    final all = SubtitleBgColor.values;
+    return all[(index + 1) % all.length];
+  }
+
+  static SubtitleBgColor fromWire(String? wire) {
+    for (final c in SubtitleBgColor.values) {
+      if (c.wire == wire) return c;
+    }
+    return SubtitleBgColor.midnight;
+  }
+}
+
 /// 悬浮窗显示设置
 class OverlaySettings {
   const OverlaySettings({
@@ -120,6 +190,7 @@ class OverlaySettings {
     this.opacity = defaultOpacity,
     this.position = SubtitlePosition.bottom,
     this.order = SubtitleOrder.sourceFirst,
+    this.backgroundColor = SubtitleBgColor.midnight,
   });
 
   // ---- 取值范围 ----
@@ -132,35 +203,54 @@ class OverlaySettings {
   static const double fontSizeStep = 1.0;
   static const double defaultFontSize = 16.0;
 
-  static const double minOpacity = 0.3;
+  static const double minOpacity = 0.25;
   static const double maxOpacity = 1.0;
-  static const double defaultOpacity = 0.95;
 
-  /// 透明度循环档位
+  /// 背景不透明度的默认值：**必须是不透明**
   ///
-  /// 用固定档位而不是滑杆：悬浮窗只有 34dp 高的控制栏，
-  /// 放不下滑杆；而且用户要的是「太挡视线了 → 再透明点」，
-  /// 三四个档已经够用。
-  static const List<double> opacityLevels = [0.6, 0.8, 0.95, 1.0];
+  /// 旧默认 0.95 在深色内容上几乎等于看不见。用户排查「悬浮窗到底有没有
+  /// 出来」时，一个实心块是第一判据，所以默认拉满。
+  static const double defaultOpacity = 1.0;
+
+  /// 背景不透明度循环档位（升序）
+  ///
+  /// ## v0.9.2：从 4 档扩到 5 档，下限 0.6 → 0.25
+  ///
+  /// 用户原话是「太挡视线了 → 再透明点」。旧档位最低 0.6，
+  /// 在小屏上仍然盖住小半个屏幕，等于没得选。
+  ///
+  /// 现在最低 0.25，且**只作用于背景**：文字始终不透明，
+  /// 所以「几乎全透明背景 + 清晰文字」是可达状态 —— 这才是字幕该有的形态。
+  ///
+  /// 不提供 0.0：完全透明的背景下只剩边框两根线，用户会以为是渲染 bug。
+  static const List<double> opacityLevels = [0.25, 0.4, 0.6, 0.8, 1.0];
 
   final double fontSize;
+
+  /// 背景不透明度（**只作用于背景，不作用于文字**）
   final double opacity;
+
   final SubtitlePosition position;
 
   /// 双语字幕的上下顺序（原文在上 / 译文在上）
   final SubtitleOrder order;
+
+  /// 背景色预设（自带配套前景色，保证对比度）
+  final SubtitleBgColor backgroundColor;
 
   OverlaySettings copyWith({
     double? fontSize,
     double? opacity,
     SubtitlePosition? position,
     SubtitleOrder? order,
+    SubtitleBgColor? backgroundColor,
   }) {
     return OverlaySettings(
       fontSize: fontSize ?? this.fontSize,
       opacity: opacity ?? this.opacity,
       position: position ?? this.position,
       order: order ?? this.order,
+      backgroundColor: backgroundColor ?? this.backgroundColor,
     );
   }
 
@@ -190,6 +280,10 @@ class OverlaySettings {
 
   OverlaySettings get withNextPosition => copyWith(position: position.next);
 
+  /// 背景色切到下一档（循环）
+  OverlaySettings get withNextBackground =>
+      copyWith(backgroundColor: backgroundColor.next);
+
   bool get canIncreaseFont => fontSize < maxFontSize - 0.001;
   bool get canDecreaseFont => fontSize > minFontSize + 0.001;
 
@@ -199,6 +293,7 @@ class OverlaySettings {
         'opacity': opacity,
         'position': position.wire,
         'order': order.wire,
+        'backgroundColor': backgroundColor.wire,
       };
 
   /// 从不可信来源解析
@@ -222,6 +317,7 @@ class OverlaySettings {
       opacity: opa,
       position: SubtitlePosition.fromWire(map['position'] as String?),
       order: SubtitleOrder.fromWire(map['order'] as String?),
+      backgroundColor: SubtitleBgColor.fromWire(map['backgroundColor'] as String?),
     );
   }
 
@@ -231,7 +327,8 @@ class OverlaySettings {
       (other.fontSize - fontSize).abs() < 0.001 &&
       (other.opacity - opacity).abs() < 0.001 &&
       other.position == position &&
-      other.order == order;
+      other.order == order &&
+      other.backgroundColor == backgroundColor;
 
   @override
   int get hashCode => Object.hash(
@@ -239,12 +336,14 @@ class OverlaySettings {
         opacity.toStringAsFixed(2),
         position,
         order,
+        backgroundColor,
       );
 
   @override
   String toString() =>
-      'OverlaySettings(font=$fontSize, opacity=$opacity, '
-      'pos=${position.wire}, order=${order.wire})';
+      'OverlaySettings(font=$fontSize, bgOpacity=$opacity, '
+      'pos=${position.wire}, order=${order.wire}, '
+      'bg=${backgroundColor.wire})';
 }
 
 /// 设置的读写（单例，带内存缓存）
@@ -260,6 +359,7 @@ class OverlaySettingsStore {
   static const String _kOpacity = 'overlay.opacity';
   static const String _kPosition = 'overlay.position';
   static const String _kOrder = 'overlay.order';
+  static const String _kBackground = 'overlay.background_color';
 
   OverlaySettings _cached = const OverlaySettings();
   bool _loaded = false;
@@ -282,6 +382,8 @@ class OverlaySettingsStore {
             .clamp(OverlaySettings.minOpacity, OverlaySettings.maxOpacity),
         position: SubtitlePosition.fromWire(prefs.getString(_kPosition)),
         order: SubtitleOrder.fromWire(prefs.getString(_kOrder)),
+        backgroundColor:
+            SubtitleBgColor.fromWire(prefs.getString(_kBackground)),
       );
       _loaded = true;
     } catch (_) {
@@ -302,6 +404,7 @@ class OverlaySettingsStore {
       await prefs.setDouble(_kOpacity, settings.opacity);
       await prefs.setString(_kPosition, settings.position.wire);
       await prefs.setString(_kOrder, settings.order.wire);
+      await prefs.setString(_kBackground, settings.backgroundColor.wire);
     } catch (_) {
       // 落盘失败只影响下次启动，本次运行不受影响
     }

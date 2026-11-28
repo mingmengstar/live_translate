@@ -64,6 +64,11 @@ enum OverlayCommand {
   /// 循环切换透明度
   cycleOpacity,
 
+  /// 循环切换背景色（午夜黑 → 石板灰 → 纯白 → 青色 → …）
+  ///
+  /// 纯展示偏好，但**仍要回主 App**：主 App 是设置的权威持有者。
+  cycleBackground,
+
   /// 循环切换位置
   cyclePosition,
 
@@ -96,6 +101,8 @@ extension OverlayCommandWire on OverlayCommand {
         return 'fontDecrease';
       case OverlayCommand.cycleOpacity:
         return 'cycleOpacity';
+      case OverlayCommand.cycleBackground:
+        return 'cycleBackground';
       case OverlayCommand.cyclePosition:
         return 'cyclePosition';
       case OverlayCommand.toggleOrder:

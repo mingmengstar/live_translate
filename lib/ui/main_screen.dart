@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/i18n/language_registry.dart';
 import 'package:live_translate/core/model/model_catalog.dart';
+import 'package:live_translate/core/overlay/overlay_controller.dart';
 import 'package:live_translate/core/overlay/overlay_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';
 
@@ -49,9 +50,16 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   late Animation<double> _glowAnimation;
   late Animation<double> _pulseAnimation;
 
+  /// 悬浮窗权限是否已授予（null = 还没查出来）
+  ///
+  /// 为什么在 State 里缓存：`hasPermission()` 走 MethodChannel 是异步的，
+  /// `build()` 里不能 await。查到之前显示「检测中…」而不是误报「未授权」。
+  bool? _overlayPermissionGranted;
+
   @override
   void initState() {
     super.initState();
+    _refreshOverlayPermission();
 
     // 发光动画控制器 - 只在非测试环境创建动画
     if (!_kIsTestEnvironment) {
@@ -94,6 +102,16 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     _glowController.dispose();
     _pulseController.dispose();
     super.dispose();
+  }
+
+  /// 查询一次悬浮窗权限并写进 State
+  ///
+  /// 失败（测试环境 / 通道不可用）时置 false —— 宁可显示「未授权」
+  /// 也不要卡在「检测中…」，因为后者会让用户不知道该做什么。
+  Future<void> _refreshOverlayPermission() async {
+    final granted = await OverlayController.instance.hasPermission();
+    if (!mounted) return;
+    setState(() => _overlayPermissionGranted = granted);
   }
 
   @override
@@ -511,6 +529,19 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                       ? Colors.orangeAccent
                       : Colors.grey),
           ),
+          // 悬浮窗权限：**单独一行，且带一键授权入口**
+          //
+          // ## 为什么它必须独立于「悬浮窗状态」那行
+          //
+          // 真机上排查发现：`appops get <pkg> SYSTEM_ALERT_WINDOW` 返回
+          // `default`（= 未授权）时，`Settings.canDrawOverlays()` 是 false，
+          // 插件 `showOverlay()` 第一句 `checkOverlayPermission()` 就不通过，
+          // 直接 `result.error("PERMISSION")` 返回 —— 窗口根本没有被创建。
+          //
+          // 而「悬浮窗」那行只会显示一句「未获得权限」，用户看完仍然不知道
+          // 该点哪里。这里把权限状态与授权按钮并排放出来，
+          // 让「授权 → 重试」变成两次点击之内能完成的事。
+          _buildOverlayPermissionRow(context, service),
           // 服务在跑但窗口没出来 → 给一个直接补上的入口
           if (service.isServiceRunning && !service.isOverlayVisible)
             Align(
@@ -599,11 +630,26 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   ? () => service.updateOverlaySettings(s.withLargerFont)
                   : null,
             ),
-            // 透明度
+            // 背景不透明度
             _buildSettingChip(
               icon: Icons.opacity_rounded,
-              tooltip: '切换悬浮窗透明度（当前 ${(s.opacity * 100).round()}%）',
+              tooltip: '悬浮窗背景不透明度（当前 ${(s.opacity * 100).round()}%，'
+                  '只影响背景，文字始终清晰）',
               onTap: () => service.updateOverlaySettings(s.withNextOpacity),
+              label: '${(s.opacity * 100).round()}%',
+            ),
+            // 背景色预设
+            //
+            // 为什么值得给一个专门的 chip 而不是塞进「透明度」：
+            // 用户要解决的第一个问题是「它到底有没有出来」。
+            // 深色底 + 深色内容 = 看不见，而换到「纯白」就能立刻确认。
+            // 这是排查顺序里最靠前的一步，必须一键可达。
+            _buildSettingChip(
+              icon: Icons.palette_rounded,
+              tooltip: '悬浮窗背景色（当前：${s.backgroundColor.label}）',
+              onTap: () => service.updateOverlaySettings(s.withNextBackground),
+              label: s.backgroundColor.label,
+              swatch: s.backgroundColor.background,
             ),
             // 位置
             _buildSettingChip(
@@ -636,15 +682,17 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     );
   }
 
-  /// 设置区的小按钮（可带文字标签）
+  /// 设置区的小按钮（可带文字标签 / 色块）
   Widget _buildSettingChip({
     required IconData icon,
     required String tooltip,
     required VoidCallback? onTap,
     String? label,
+    /// 色块：用于「背景色」chip 直接展示当前颜色
+    Color? swatch,
   }) {
     final enabled = onTap != null;
-    final color = enabled ? Colors.grey[300] : Colors.grey[700];
+    final color = enabled ? Colors.grey[300]! : Colors.grey[700]!;
     return Tooltip(
       message: tooltip,
       child: InkWell(
@@ -660,9 +708,21 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 14, color: color),
+              if (swatch != null)
+                Container(
+                  width: 12,
+                  height: 12,
+                  margin: const EdgeInsets.only(right: 6),
+                  decoration: BoxDecoration(
+                    color: swatch,
+                    borderRadius: BorderRadius.circular(3),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                )
+              else
+                Icon(icon, size: 14, color: color),
               if (label != null) ...[
-                const SizedBox(width: 4),
+                if (swatch == null) const SizedBox(width: 4),
                 Text(label, style: TextStyle(color: color, fontSize: 11)),
               ],
             ],
@@ -670,6 +730,117 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  /// 悬浮窗权限行（状态 + 一键授权）
+  ///
+  /// 权限状态是**异步查询**的（走 MethodChannel 问原生 `canDrawOverlays`），
+  /// 所以在 State 里缓存一份，由 [initState] 与授权返回后刷新。
+  Widget _buildOverlayPermissionRow(
+    BuildContext context,
+    TranslationService service,
+  ) {
+    final granted = _overlayPermissionGranted;
+    final Color color;
+    final String text;
+    if (granted == null) {
+      color = Colors.grey;
+      text = '检测中…';
+    } else if (granted) {
+      color = Colors.greenAccent;
+      text = '已授权';
+    } else {
+      color = Colors.redAccent;
+      text = '未授权（悬浮窗不能显示）';
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              '悬浮窗权限',
+              style: TextStyle(color: Colors.grey[500], fontSize: 14),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: color,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+              textAlign: TextAlign.end,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (granted == false) ...[
+            const SizedBox(width: 4),
+            TextButton(
+              onPressed: () => _requestOverlayPermission(context, service),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.orangeAccent,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                minimumSize: const Size(0, 32),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: const Text('去授权', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 请求悬浮窗权限；用户回来后自动复查 + 若服务在跑则顺便重开窗口
+  ///
+  /// `requestPermission()` 内部会「跳系统设置页 → 轮询 400ms×60s」，
+  /// 所以这里 await 返回 true 时，用户已经在设置里打开了开关并且回到了 App。
+  ///
+  /// 返回后必须做两件事：
+  /// 1. 刷新本页的权限显示（否则界面还停在「未授权」）；
+  /// 2. 如果翻译服务已经在跑，立刻重试挂窗口 ——
+  ///    用户的预期是「授权完悬浮窗就该出来」，不该再让他去点一次。
+  Future<void> _requestOverlayPermission(
+    BuildContext context,
+    TranslationService service,
+  ) async {
+    final granted = await OverlayController.instance.requestPermission();
+    if (!mounted) return;
+    setState(() => _overlayPermissionGranted = granted);
+
+    if (!context.mounted) return;
+    if (!granted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('仍未获得「显示在其他应用上层」权限'),
+          duration: Duration(seconds: 5),
+        ),
+      );
+      return;
+    }
+
+    // 授权成功：服务在跑就立刻把窗口挂出来
+    if (service.isServiceRunning) {
+      final result = await service.retryOverlay();
+      if (!mounted || !context.mounted) return;
+      setState(() => _overlayPermissionGranted = granted);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.ok ? '悬浮窗已显示' : '仍无法显示：${result.reason}'),
+          duration: Duration(seconds: result.ok ? 3 : 6),
+        ),
+      );
+    } else {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('权限已授予，点开始即可显示悬浮窗')),
+      );
+    }
   }
 
   Widget _buildStatusRow(
