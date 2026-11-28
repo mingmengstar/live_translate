@@ -35,7 +35,7 @@ class _ModelImportScreenState extends State<ModelImportScreen> {
   AsrModelVariant _variant = AsrModelVariant.zhEn;
 
   /// 当前选择的翻译模型
-  MtModelVariant _mtVariant = MtModelVariant.hyMt15Q4;
+  MtModelVariant _mtVariant = MtModelVariant.hyMt3StreamRevise;
 
   /// 是否附带翻译模型
   bool _withTranslation = true;

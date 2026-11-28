@@ -29,10 +29,25 @@ import 'package:live_translate/core/service/app_settings.dart';
 
 void main() {
   group('LanguageRegistry 数据完整性', () {
-    test('至少覆盖 9 种语言（v0.6.0 的识别模型数量是下限）', () {
-      // 这不是「越多越好」的审美判断：每一种 AsrModelVariant 都对应一份
-      // 用户能真下载到的模型，语言清单少一种就有人的模型白下。
-      expect(LanguageRegistry.all.length, greaterThanOrEqualTo(9));
+    test('只包含中日英三种语言（v0.8.0 收敛范围）', () {
+      // 这不是「越多越好」的审美判断：翻译模型（Hy-MT2/Hy-MT3 StreamRevise）
+      // 只在中/英/日上训练过，其余语种属于零样本外推，质量不可控。
+      // 给用户一个翻译不准的假选项，比不给他选项更糟。
+      expect(
+        LanguageRegistry.all.map((l) => l.code).toList(),
+        ['zh', 'en', 'ja'],
+      );
+    });
+
+    test('已删除的语种不再被认识', () {
+      // 老版本持久化里可能残留 ko/fr/de/es/ru 等代码，必须能安全降级。
+      for (final removed in ['ko', 'fr', 'de', 'es', 'ru', 'th', 'vi', 'ar', 'id']) {
+        expect(
+          LanguageRegistry.isKnown(removed),
+          isFalse,
+          reason: '$removed 应当已从注册表移除',
+        );
+      }
     });
 
     test('语言代码唯一（重复会让下拉框出现两个同 value 的 item）', () {
@@ -78,11 +93,27 @@ void main() {
       expect(zh!.displayLabel, '日语 (日本語)');
     });
 
-    test('englishName 与 code 不混淆（MT prompt 必须写全称）', () {
-      // 混元 / Qwen 的指令模板写 `Japanese` 才有稳定输出，写 `ja` 会乱。
+    test('englishName 与 code 不混淆（Hy-MT2 prompt 必须写全称）', () {
+      // Hy-MT2 的 StreamRevise 模板写 `Japanese` 才有稳定输出，写 `ja` 会乱。
       expect(LanguageRegistry.mtPromptName('ja'), 'Japanese');
       expect(LanguageRegistry.mtPromptName('zh'), 'Chinese');
-      expect(LanguageRegistry.mtPromptName('ko'), 'Korean');
+      expect(LanguageRegistry.mtPromptName('en'), 'English');
+    });
+
+    test('Hy-MT3 prompt 必须用中文语言名（与 Hy-MT2 不同）', () {
+      // Hy-MT3 官方模板是「翻译为日语」，写英文会掉质量。
+      // 两套命名必须分开，混用不会报错，只会输出原文或乱码。
+      expect(LanguageRegistry.mtPromptNameZh('ja'), '日语');
+      expect(LanguageRegistry.mtPromptNameZh('zh'), '中文');
+      expect(LanguageRegistry.mtPromptNameZh('en'), '英语');
+
+      // 交叉验证：两套命名不能相同，否则说明某处写错了
+      for (final code in ['zh', 'en', 'ja']) {
+        expect(
+          LanguageRegistry.mtPromptName(code),
+          isNot(LanguageRegistry.mtPromptNameZh(code)),
+        );
+      }
     });
   });
 
@@ -214,16 +245,15 @@ void main() {
       }
     });
 
-    test('法语 / 德语 / 西班牙语 / 俄语 各自推荐到专用模型', () {
-      // 这四个语种是 v0.6.0 新增的，也是最容易被漏掉的一批。
-      expect(ModelCatalog.recommendedFor('fr'), AsrModelVariant.french);
-      expect(ModelCatalog.recommendedFor('de'), AsrModelVariant.german);
-      expect(ModelCatalog.recommendedFor('es'), AsrModelVariant.spanish);
-      expect(ModelCatalog.recommendedFor('ru'), AsrModelVariant.russian);
+    test('每种语言都推荐到能真正识别它的模型', () {
+      // v0.8.0：只剩中日英。ja 必须用多语种模型（中英模型认不出假名）。
+      expect(ModelCatalog.recommendedFor('zh'), AsrModelVariant.chinese);
+      expect(ModelCatalog.recommendedFor('en'), AsrModelVariant.english);
+      expect(ModelCatalog.recommendedFor('ja'), AsrModelVariant.multilingual);
     });
 
-    test('未知语种仍退回中英双语（不抛异常）', () {
-      expect(ModelCatalog.recommendedFor('xx'), AsrModelVariant.zhEn);
+    test('未知语种仍退回默认（不抛异常）', () {
+      expect(ModelCatalog.recommendedFor('xx'), AsrModelVariant.multilingual);
     });
   });
 
@@ -266,9 +296,9 @@ void main() {
 
     test('保存已知语言代码正常生效', () async {
       final store = AppSettingsStore.instance;
-      await store.saveLanguages(asrLanguage: 'ja', mtTargetLang: 'ko');
+      await store.saveLanguages(asrLanguage: 'ja', mtTargetLang: 'en');
       expect(store.asrLanguage, 'ja');
-      expect(store.mtTargetLang, 'ko');
+      expect(store.mtTargetLang, 'en');
     });
   });
 }

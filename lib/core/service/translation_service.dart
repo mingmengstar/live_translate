@@ -39,13 +39,56 @@ class TranslationService extends ChangeNotifier {
   // 当前识别的临时文本（用于显示中间结果）
   String _currentPartialText = '';
   String _currentTranslatedPartial = '';
-  // 语言设置
+
+  // ---- v0.8.0 流式翻译状态 ----
+  //
+  // 这套状态是「实时字幕」的核心。StreamRevise 模型是无状态的，
+  // 由调用方（也就是这里）维护「当前句译文链」与「前文上下文」。
+  //
+  // 旧实现的致命问题：只在 `isFinal` 时才翻译。等一整句说完再翻，
+  // 既不实时，也让 StreamRevise 模型的「前缀保留 + 修订」能力完全失效。
+
+  /// 当前句的累计识别文本（ASR 最后一次上报的版本）
+  String _sentenceSource = '';
+
+  /// 当前句**上一版原文**（上一轮 ASR 的识别文本）
+  ///
+  /// 只给 **Hy-MT2** 模板的 `Previous version of the current source:` 用。
+  /// Hy-MT3 模板刻意不传上一版原文（见 `LlamaMTEngine` 的模板注释），
+  /// 渲染时会忽略它。
+  ///
+  /// 必须真的存「上一轮识别文本」：拿译文顶替会让模型以为
+  /// 「上一版原文就是这段译文」，前缀对照从输入层就是错的。
+  String _sentencePreviousSource = '';
+
+  /// 当前句**上一版译文**
+  ///
+  /// 这是 StreamRevise 模型最关键的输入：它靠比对这个值来决定
+  /// 沿用哪段前缀、改写哪一段。必须每轮翻译后更新。
+  String _sentenceTranslation = '';
+
+  /// 已定稿句子的原文（用于「前文上下文」，最多 [maxContextSentences] 句）
+  final List<String> _recentSources = [];
+
+  /// 前文上下文最多保留几句（模型卡建议 5 句）
+  static const int maxContextSentences = 5;
+
+  /// 当前句是否已经定稿（定稿后不再接受新文本，直到下一句开始）
+  bool _sentenceFinalized = false;
+
+  /// 是否正在翻译（避免同一时刻堆积多个推理请求）
+  bool _isTranslating = false;
+
+  /// 是否正在翻译（诊断 / 测试用）
+  bool get isTranslating => _isTranslating;
+
+  /// 语言设置
   String _asrLanguage = 'en';
   String _mtSourceLang = 'en';
   String _mtTargetLang = 'ja';
 
   /// 当前选用的翻译模型（决定提示词模板与内存需求）
-  MtModelVariant _mtModelVariant = MtModelVariant.hyMt15Q4;
+  MtModelVariant _mtModelVariant = MtModelVariant.hyMt3StreamRevise;
 
   /// 当前选用的翻译模型
   MtModelVariant get mtModelVariant => _mtModelVariant;
@@ -250,7 +293,7 @@ class TranslationService extends ChangeNotifier {
           : 'Silero VAD 可用';
       await _audioCapture.initialize(
         sileroModelPath: vadPath,
-        onAudioSegment: _onAudioSegment,
+        onAudioChunk: _onAudioChunk,
       );
     } catch (e) {
       log('[TranslationService] 重载 VAD 失败: $e', name: 'TranslationService');
@@ -506,7 +549,7 @@ class TranslationService extends ChangeNotifier {
 
     await _audioCapture.initialize(
       sileroModelPath: vadModelPath,
-      onAudioSegment: _onAudioSegment,
+      onAudioChunk: _onAudioChunk,
     );
 
     // 把 VAD 后端结论暴露给 UI（首页 / 控制台可展示当前用的是 Silero 还是能量）
@@ -720,8 +763,11 @@ class TranslationService extends ChangeNotifier {
     _sendToOverlay();
   }
 
-  /// 音频段回调（来自 VAD）
-  void _onAudioSegment(Uint8List audioData) {
+  /// 音频块回调（来自音频捕获服务）
+  ///
+  /// v0.8.0：收到的是**连续原始 PCM**（不再等 VAD 切段），
+  /// 直接转给 ASR 的流式识别器。切句完全交给识别器自带的端点检测。
+  void _onAudioChunk(Uint8List audioData) {
     if (_isServiceRunning) {
       _engineManager.pushAudioToASR(audioData);
     }
@@ -786,7 +832,11 @@ class TranslationService extends ChangeNotifier {
 
       _isServiceRunning = true;
       _subtitleBuffer.clear();
-      // 新一轮服务：把「用户主动收起」的意图清掉，
+      // 新一轮服务：清空流式翻译的全部状态。
+      // 不清的话，上一轮的译文链会作为 previousTranslation 传给模型，
+      // 导致新一句话被"嫁接"到旧字幕上。
+      _resetStreamingState();
+      // 把「用户主动收起」的意图清掉，
       // 否则上一轮收起过，这一轮点了开始却看不到悬浮窗。
       _overlayDismissedByUser = false;
 
@@ -898,9 +948,9 @@ class TranslationService extends ChangeNotifier {
       await _audioCapture.stop();
       
       _isServiceRunning = false;
-      _currentPartialText = '';
-      _currentTranslatedPartial = '';
-      _debounceTimer?.cancel();
+      // 停止时也要清掉流式状态：本轮已定稿的句子不该出现在下一轮的
+      // previousTranslation / 前文上下文里。
+      _resetStreamingState();
       _updateStatus('服务已停止');
       notifyListeners();
     } catch (e, stack) {
@@ -926,68 +976,238 @@ class TranslationService extends ChangeNotifier {
     await _engineManager.pushAudioToASR(audioData);
   }
   
-  /// ASR 结果回调
+  /// ASR 结果回调 —— **实时字幕的核心链路**
+  ///
+  /// ## v0.8.0：中间结果也翻译
+  ///
+  /// 旧实现只在 `isFinal` 时翻译，等于「等整句说完再翻」：
+  /// 用户说 5 秒，前 5 秒屏幕全空。这不是实时翻译。
+  ///
+  /// 现在每次 ASR 文本变化都触发一次翻译，并把「本句上一版译文」
+  /// 一起交给模型 —— 这正是 StreamRevise 系列被设计出来的用法：
+  ///
+  /// | 时刻 | ASR 文本 | 传给模型的 previousTranslation | 模型行为 |
+  /// |---|---|---|---|
+  /// | t0 | "I want to" | ""（首译） | 译出半句，不猜后文 |
+  /// | t1 | "I want to go" | "我想" | 保留"我想"，只补新内容 |
+  /// | t2 | "I want to go home" | "我想去" | 保留"我想去"，补"回家" |
+  /// | t3（定稿） | 同上 | "我想去回家" | 补齐结尾标点，收尾 |
+  ///
+  /// ## 并发控制
+  ///
+  /// 模型一次只能跑一个生成。ASR 每 ~300ms 就可能更新一次，
+  /// 如果不加控制会堆积请求、越翻越慢（这正是「字幕卡住不动」的成因）。
+  ///
+  /// 策略：**最新优先**。新文本到来时取消正在跑的那次推理，
+  /// 立刻用最新文本重开一次。丢弃的中间态没有价值 ——
+  /// 反正下一次会用更完整的文本重译。
   void _onASRResult(ASRResult result) {
-    log('[TranslationService] ASR: ${result.text} (final: ${result.isFinal})', name: 'TranslationService');
-    
-    // 更新当前部分文本
-    _currentPartialText = result.text;
-    
-    if (result.isFinal) {
-      // 最终结果：触发翻译
-      _currentPartialText = '';
-      _translateText(result.text);
-    } else {
-      // 中间结果：直接显示（不翻译，避免频繁调用 MT）
+    final text = result.text.trim();
+    if (text.isEmpty) return;
+
+    log(
+      '[TranslationService] ASR: "$text" (final: ${result.isFinal})',
+      name: 'TranslationService',
+    );
+
+    // 已定稿的句子不再接受新内容（同一句的迟到中间结果直接忽略）
+    if (_sentenceFinalized && !result.isFinal) {
+      return;
+    }
+
+    _currentPartialText = text;
+    _sentenceSource = text;
+
+    unawaited(_translateCurrentSentence(isFinal: result.isFinal));
+  }
+
+  /// 翻译「当前句」的最新版本
+  ///
+  /// [isFinal] 为 true 表示 ASR 已定稿，本轮翻译完成后要把这句
+  /// 归入「前文上下文」并开启新句。
+  Future<void> _translateCurrentSentence({required bool isFinal}) async {
+    final text = _sentenceSource;
+    if (text.isEmpty) return;
+
+    final mt = _engineManager.currentMT;
+    if (mt == null) {
+      _isTranslating = false;
+      return;
+    }
+
+    // 取消上一次未完成的推理（最新优先）
+    if (mt is LlamaMTEngine) {
+      await mt.cancel();
+    }
+
+    _isTranslating = true;
+    final previous = _sentenceTranslation;
+    final previousSource = _sentencePreviousSource;
+
+    // 构造请求时**必须**带上上一版译文与前文上下文。
+    // 少传任何一个，StreamRevise 模型就退回成普通翻译模型，
+    // 「前缀保留 / 增量修订」能力全部失效。
+    //
+    // previousSource 单独传：Hy-MT2 的模板有独立的
+    // `Previous version of the current source:` 槽位，必须先记下
+    // 「本轮识别文本」，下一轮才有真正的上一版原文可用。
+    final request = StreamTranslateRequest(
+      text: text,
+      previousTranslation: previous,
+      previousSource: previousSource,
+      recentSources: List<String>.from(_recentSources),
+      isFinal: isFinal,
+    );
+
+    // 本轮结束后，本次文本就是「下一轮的上一版原文」。
+    //
+    // 必须在发起翻译**之前**记：翻译是异步的，中间可能又有新 ASR 结果进来并
+    // 覆盖 `_sentenceSource`；用局部变量 `text` 才对应本次请求的那一版。
+    if (!isFinal) {
+      _sentencePreviousSource = text;
+    }
+
+    try {
+      // 只有真实引擎才走修订接口；其它实现（测试用 Mock）走通用接口。
+      final completer = Completer<MTResult?>();
+      if (mt is LlamaMTEngine) {
+        unawaited(
+          mt.translateStreamRevise(
+            request: request,
+            onChunk: (_) {},
+            onComplete: (result) {
+              if (!completer.isCompleted) completer.complete(result);
+            },
+            onError: (error, stack) {
+              if (!completer.isCompleted) completer.completeError(error, stack);
+            },
+          ),
+        );
+      } else {
+        unawaited(
+          mt.translateStream(
+            text: text,
+            onChunk: (_) {},
+            onComplete: (result) {
+              if (!completer.isCompleted) completer.complete(result);
+            },
+            onError: (error, stack) {
+              if (!completer.isCompleted) completer.completeError(error, stack);
+            },
+          ),
+        );
+      }
+
+      final result = await completer.future;
+      if (result == null) {
+        _isTranslating = false;
+        return;
+      }
+
+      var translated = result.translatedText.trim();
+
+      // 模型对极短片段可能返回空串（模型卡明确说明这是预期行为）。
+      // 此时保留上一版译文继续显示，不要清空 —— 清空会让字幕闪烁。
+      if (translated.isEmpty) {
+        translated = previous;
+      }
+      if (translated.isEmpty) {
+        _isTranslating = false;
+        return;
+      }
+
+      // 更新译文链：下一轮请求要带这一版作为 previousTranslation
+      _sentenceTranslation = translated;
+      _currentTranslatedPartial = translated;
+
+      // 推给悬浮窗与 UI（内部有 100ms 防抖）
+      _scheduleDebouncedUpdate(
+        sourceText: text,
+        translatedText: translated,
+        isFinal: isFinal,
+      );
+
+      if (isFinal) {
+        _commitSentence(text, translated);
+      }
+    } catch (e, stack) {
+      // 「被更新的识别结果打断」是实时字幕的**正常节奏**，不是错误。
+      //
+      // 不加这个分支的话，用户每说一句话都会看到几十条「MT Error」日志
+      // （ASR 每 ~300ms 更新一次 → 每句话都可能取消若干次）。
+      if (e is TranslationCancelledException) {
+        return;
+      }
+      _lastError = '翻译错误: $e';
+      log(
+        '[TranslationService] MT Error: $e\n$stack',
+        name: 'TranslationService',
+      );
       notifyListeners();
+    } finally {
+      _isTranslating = false;
     }
   }
-  
+
+  /// 定稿一句：归入前文上下文 + 清空本句状态
+  void _commitSentence(String source, String translation) {
+    _sentenceFinalized = true;
+
+    // 前文上下文只保留最近 N 句原文（模型卡建议最多 5 句）
+    if (source.trim().isNotEmpty) {
+      _recentSources.add(source.trim());
+      while (_recentSources.length > maxContextSentences) {
+        _recentSources.removeAt(0);
+      }
+    }
+
+    _addSubtitleEntry(
+      sourceText: source,
+      translatedText: translation,
+      isFinal: true,
+    );
+
+    // 开启新句：清空本句状态，但**保留** _recentSources 作为上下文
+    _sentenceSource = '';
+    _sentencePreviousSource = '';
+    _sentenceTranslation = '';
+    _sentenceFinalized = false;
+    _currentPartialText = '';
+    _currentTranslatedPartial = '';
+  }
+
+  /// 前文上下文（供引擎读取，测试也用它做断言）
+  List<String> get recentSources => List.unmodifiable(_recentSources);
+
+  /// 当前句的上一版译文（供测试断言「前缀保留」链路是否生效）
+  String get currentSentenceTranslation => _sentenceTranslation;
+
+  /// 清空全部流式翻译状态（服务启动 / 停止时调用）
+  ///
+  /// 必须清的三处：
+  /// - `_sentenceSource` / `_sentenceTranslation`：本句进行中的状态；
+  /// - `_recentSources`：前文上下文，跨轮复用会让新对话被旧话题带偏；
+  /// - `_sentenceFinalized`：上一轮如果最后一个字定稿后立刻停止，
+  ///   这个标志会残留成 true，导致新一轮第一句的中间结果全被忽略。
+  void _resetStreamingState() {
+    _sentenceSource = '';
+    _sentencePreviousSource = '';
+    _sentenceTranslation = '';
+    _recentSources.clear();
+    _sentenceFinalized = false;
+    _currentPartialText = '';
+    _currentTranslatedPartial = '';
+    _isTranslating = false;
+    _debounceTimer?.cancel();
+    _debounceTimer = null;
+  }
+
   /// ASR 错误回调
   void _onASRError(Object error, StackTrace stack) {
     _lastError = 'ASR 错误: $error';
     _updateStatus('ASR 出错');
     log('[TranslationService] ASR Error: $error\n$stack', name: 'TranslationService');
     notifyListeners();
-  }
-  
-  /// 翻译文本
-  Future<void> _translateText(String text) async {
-    if (text.trim().isEmpty) return;
-    
-    try {
-      await _engineManager.translateStreamWithMT(
-        text: text,
-        onChunk: (chunk) {
-          _currentTranslatedPartial = chunk.text;
-          
-          // 防抖更新悬浮窗（100ms 节流）
-          _scheduleDebouncedUpdate(
-            sourceText: text,
-            translatedText: chunk.text,
-            isFinal: chunk.isFinal,
-          );
-        },
-        onComplete: (result) {
-          _currentTranslatedPartial = '';
-          _addSubtitleEntry(
-            sourceText: result.sourceText,
-            translatedText: result.translatedText,
-            isFinal: true,
-          );
-        },
-        onError: (error, stack) {
-          _lastError = '翻译错误: $error';
-          _currentTranslatedPartial = '';
-          log('[TranslationService] MT Error: $error\n$stack', name: 'TranslationService');
-          notifyListeners();
-        },
-      );
-    } catch (e, stack) {
-      _lastError = '翻译启动失败: $e';
-      log('[TranslationService] Translate error: $e\n$stack', name: 'TranslationService');
-      notifyListeners();
-    }
   }
   
   /// 调度防抖更新（100ms 节流，避免高频渲染崩溃）

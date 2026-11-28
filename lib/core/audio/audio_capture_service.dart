@@ -1,23 +1,48 @@
 /// 音频捕获服务
 ///
-/// 职责：拿系统内录 PCM → 丢给 VAD isolate → 收到语音段 → 回调给 ASR。
+/// 职责：拿系统内录 PCM → 丢给 VAD isolate（做电平/语音状态指示）→
+/// 同时把**连续的原始 PCM** 交给 ASR。
 ///
-/// 本版关键变化：
-/// 1. **不再依赖 `system_audio_recorder` 插件**（0.0.1 版在 Android 14 上必崩，
-///    详见下方说明），改用本项目自研的 `AudioCaptureService.kt`
-///    + MethodChannel / EventChannel。
-/// 2. **VAD 全部搬进 isolate**（`vad_isolate_worker`），主线程不再算 RMS / 拼缓冲。
-/// 3. 默认优先 **Silero VAD**（复用已声明依赖 sherpa_onnx，不新增插件），
-///    加载失败或未配置模型时自动降级到**自适应能量 VAD**。
-/// 4. 修掉了旧实现的 int16 符号扩展 bug（负样本被当正数，RMS 虚高 → 持续误触发）。
-/// 5. `stop()` 会 `flush()` 吐出最后一段，不会把用户刚说完的话丢掉。
-/// 6. `dispose()` 干净释放 isolate / 端口 / 流订阅（钢印级资源释放要求）。
+/// ## v0.8.0 关键变更：取消「VAD 切段后再喂 ASR」
+///
+/// ### 旧实现的根本性错误
+///
+/// 旧链路是 `PCM → VAD 分段 → 只把语音段的 PCM 喂给 ASR`。
+/// 这看起来合理，实际是 BUG-3（识别重复 + 识别不出）的主因：
+///
+/// 1. **VAD 把静音帧全部吃掉了**。`VadSegmenter` 只输出语音缓冲
+///    （外加 3 帧前导 / 2 帧尾部 pad），段与段之间的静音**从不进入 ASR**。
+/// 2. 而流式识别器的端点检测**恰恰靠「看到连续静音」**来判断一句话结束
+///    （`rule1MinTrailingSilence`）。流里永远凑不出静音 → `isEndpoint()`
+///    几乎恒为 false → **句子永不 finalize**。
+/// 3. 流长时间不 reset，zipformer 流式解码会反复吐出同一批 token
+///    → 用户看到的就是「**反复重复同一句**」。
+/// 4. 每段又都从半句话开始、上下文被截断 → 「**识别不出内容**」。
+///
+/// 两个现象是**同一个根因**。
+///
+/// ### 现在的分工
+///
+/// | 组件 | 职责 |
+/// |---|---|
+/// | VAD | 只做「现在有没有人在说话」的状态指示 + 电平显示，供 UI 用 |
+/// | ASR | 吃**连续**音频流，自己用内置端点检测切句 |
+///
+/// 这样只需维护**一套**切分逻辑（识别器自带的），不会互相打架。
+///
+/// ## 其它关键点（勿删）
+///
+/// 1. **不再依赖 `system_audio_recorder` 插件**（0.0.1 版在 Android 14 上必崩），
+///    改用本项目自研的 `AudioCaptureService.kt` + MethodChannel / EventChannel。
+/// 2. **VAD 全部搬进 isolate**，主线程不再算 RMS / 拼缓冲。
+/// 3. 修掉了旧实现的 int16 符号扩展 bug（负样本被当正数，RMS 虚高 → 持续误触发）。
+/// 4. `stop()` 会 `flush()` 吐出最后一段，不会把用户刚说完的话丢掉。
+/// 5. `dispose()` 干净释放 isolate / 端口 / 流订阅（钢印级资源释放要求）。
 ///
 /// ### 为什么弃用 system_audio_recorder 0.0.1
 ///
 /// 该插件在 Android 14+ 有多处致命缺陷，导致用户点「录制整个屏幕」后**闪退**：
-/// - `ForegroundService` 未在插件清单声明（只写在 example 里），
-///   `startForegroundService()` 直接抛异常并被吞掉；
+/// - `ForegroundService` 未在插件清单声明（只写在 example 里）；
 /// - `ActivityCompat.requestPermissions(this as Activity, ...)` ——
 ///   `this` 是 Service，必然 `ClassCastException`；
 /// - 前台通知未调用 `setSmallIcon()`，`startForeground()` 抛 "Invalid notification"；
@@ -66,7 +91,11 @@ class AudioCaptureService {
   final VadService _vad = VadService();
 
   // 回调
-  Function(Uint8List)? _onAudioSegment;
+  /// 连续 PCM 回调（**原始音频，不做任何切分**）
+  ///
+  /// v0.8.0：从「VAD 语音段回调」改为「连续原始 PCM 回调」。
+  /// 详见文件头「取消 VAD 切段后再喂 ASR」。
+  Function(Uint8List)? _onAudioChunk;
 
 /// 音频流订阅
   StreamSubscription<dynamic>? _audioSubscription;
@@ -131,31 +160,33 @@ class AudioCaptureService {
 
   /// 初始化音频捕获服务
   ///
-  /// [sileroModelPath] 提供时优先使用 Silero VAD；为 null 则用能量 VAD。
+  /// [sileroModelPath] 提供时 VAD 会加载 Silero 模型（用于状态指示）；
+  /// 为 null 则用能量 VAD。
+  ///
+  /// [onAudioChunk] 收到的是**连续原始 PCM**，不做任何切分 —— ASR 自己
+  /// 用内置端点检测切句（v0.8.0，见文件头）。
   ///
   /// 注意：这里**不会**请求屏幕录制授权。授权由 [start] 在用户点击开始后触发，
   /// 避免「一打开应用就弹录制选择框」。
   Future<void> initialize({
     VadConfig? config,
     String? sileroModelPath,
-    required Function(Uint8List) onAudioSegment,
+    required Function(Uint8List) onAudioChunk,
   }) async {
     _config = (config ?? const VadConfig()).copyWith(
       sileroModelPath: sileroModelPath ?? config?.sileroModelPath,
     );
-    _onAudioSegment = onAudioSegment;
+    _onAudioChunk = onAudioChunk;
 
     // 启动 VAD isolate（失败不抛异常，降级继续）
+    //
+    // v0.8.0：VAD 不再决定「喂给 ASR 哪些音频」，只提供状态 / 电平。
+    // 所以 onSegment 留空，只保留 onStateChanged 与 onLevel 供 UI 使用。
     final ready = await _vad.start(
       config: _config,
       callbacks: VadCallbacks(
         onReady: (backend, note) {
           log('[AudioCapture] VAD 就绪: $backend ($note)', name: 'AudioCapture');
-        },
-        onSegment: (segment) {
-          if (_isRecording) {
-            _onAudioSegment?.call(segment.pcm);
-          }
         },
         onError: (message) {
           log('[AudioCapture] VAD 警告: $message', name: 'AudioCapture');
@@ -164,7 +195,7 @@ class AudioCaptureService {
     );
 
     if (!ready) {
-      log('[AudioCapture] VAD isolate 未就绪，语音段将不可用', name: 'AudioCapture');
+      log('[AudioCapture] VAD isolate 未就绪，语音状态指示不可用', name: 'AudioCapture');
     }
 
     // 屏幕录制授权推迟到 start() 中按需请求
@@ -247,7 +278,9 @@ class AudioCaptureService {
 
   /// 接收音频数据（从 EventChannel）
   ///
-  /// 直接转给 VAD isolate，主线程零计算。
+  /// v0.8.0：**连续**把原始 PCM 转发给 ASR（不再等 VAD 切段），
+  /// 同时仍把数据喂给 VAD 供状态指示使用。
+  /// 主线程只做一次 send，零计算。
   void _onAudioDataReceived(dynamic data) {
     if (!_isRecording || data == null) return;
     // 收到真实数据即视为链路恢复：清掉重连计数，
@@ -262,6 +295,10 @@ class AudioCaptureService {
         ? data
         : (data is List<int> ? Uint8List.fromList(data) : null);
     if (pcm == null || pcm.isEmpty) return;
+
+    // 1) 连续喂 ASR：这就是 v0.8.0 的核心改动 —— 不切分、不丢静音
+    _onAudioChunk?.call(pcm);
+    // 2) 同时喂 VAD：只用于「有没有人在说话」的状态与电平显示
     _vad.feed(pcm);
   }
 
@@ -375,8 +412,16 @@ class AudioCaptureService {
 
       await _controlChannel.invokeMethod<bool>('stopCapture');
 
-      // 吐出缓冲区中残留的语音段（避免丢掉用户最后一句）
-      _vad.flush();
+      // v0.8.0：这里**不再**调用 `_vad.flush()` 来「保住最后一句」。
+      //
+      // 旧实现的问题：`_isRecording` 已经在上面被置为 false，
+      // 而 `onSegment` 回调里有 `if (_isRecording)` 判断，
+      // 所以 flush 吐出的语音段被无条件丢弃 —— 注释写的
+      // 「避免丢掉用户最后一句」实际从未生效。
+      //
+      // 现在喂给 ASR 的是连续原始 PCM，最后一句由 ASR 侧的
+      // `SherpaASREngine.stop()` → worker `flush` 负责吐出，
+      // 不依赖这里的 VAD flush。VAD 只做状态指示，无需 flush。
 
       log('[AudioCapture] 停止捕获', name: 'AudioCapture');
     } catch (e, stack) {
@@ -393,6 +438,6 @@ class AudioCaptureService {
     _reconnectTimer = null;
     _isReconnecting = false;
     await _vad.dispose();
-    _onAudioSegment = null;
+    _onAudioChunk = null;
   }
 }

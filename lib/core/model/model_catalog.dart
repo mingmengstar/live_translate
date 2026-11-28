@@ -1,25 +1,41 @@
 /// 模型清单（下载源唯一事实来源）
 ///
-/// 所有条目均由真实网络实测确认（HuggingFace / GitHub 官方发布物），非占位：
-/// - `url`：HuggingFace `resolve/main` 或 GitHub release 直链
-///   （均支持 HTTP Range，可断点续传）
-/// - `sizeBytes`：服务端声明的准确字节数
+/// ## v0.8.0：只保留中日英 + 两个 StreamRevise 流式翻译模型
 ///
-/// ## v0.6.0：移除 SHA-256 校验
+/// ### 为什么换成 StreamRevise 系列
 ///
-/// 旧实现下载完每个文件都要现算一遍 SHA-256。1.06GB 的翻译权重在手机上
-/// 算一次要几十秒；更糟的是只要镜像 / 代理改写了字节，就会
-/// 「下完 → 校验失败 → 删掉重下」，陷入永远下不完的死循环。
+/// 旧版用 `Hy-MT1.5-1.8B` 做「整句翻译」：等 ASR 吐出一整句（isFinal），
+/// 再一次性送进模型。这条路在实时字幕场景下有两个硬伤：
 ///
-/// 现在只校验「字节数是否等于服务端声明值」：
-/// - 能挡住截断（`written != sizeBytes` 即视为不完整，保留 `.part` 续传）；
-/// - 真正的模型损坏会在 `llama.cpp` / `sherpa-onnx` 加载阶段立刻报错，
-///   而不是让用户在下载阶段白等几十分钟。
+/// 1. **延迟等于一整句的说话时长** —— 用户说完才发现译文，不叫实时；
+/// 2. 通用翻译指令不携带「上一版译文」，ASR 每次纠错都会让译文跳变。
 ///
-/// 设计要点：
-/// - **不写死单一模型**：同一「语言包」可选不同语种的识别模型；
-/// - **VAD 独立**：Silero VAD 是所有语言包共用组件，缺失时降级能量 VAD；
-/// - **翻译模型单独成组**：体积最大，允许「先只下识别模型」的渐进式安装。
+/// 现在换成 `febilly/Hy-MT2` 与 `Hy-MT3` 的 **StreamRevise** 微调版，
+/// 它们是为流式字幕**专门训练**的：每次 ASR 局部更新都把
+/// 「当前识别文本 + 上一版译文 + 前文上下文 + 进行中/本句结束」
+/// 一起喂进去，模型会尽量沿用已经正确的前缀，只改写变化的部分。
+///
+/// ### ⚠️ 两个模型的提示词格式**不兼容**
+///
+/// | 模型 | 结构标记 | 目标语言写法 |
+/// |---|---|---|
+/// | Hy-MT3 | `【背景信息】/【待翻译文本】`（中文标记） | 中文名 `日语` |
+/// | Hy-MT2 | `[Background Information]/[Source Text]`（英文标记） | 英文名 `Japanese` |
+///
+/// 用混了**不会报错**，只会输出原文或乱码 —— 这是最难排查的一类问题。
+/// 所以 `MtPromptStyle` 必须由清单显式指定，且渲染逻辑严格分开。
+///
+/// ### 体积与内存
+///
+/// 两个模型都是 1.8B / Q4_K_M，约 1.0~1.06 GiB。手机上 n_ctx=2048 时
+/// 权重 + KV cache 约 1.2 GiB，因此要求至少 2GB 可用内存。
+///
+/// ### 校验策略（沿用 v0.6.0）
+///
+/// 只校验「写入字节数 == 服务端声明字节数」（能挡住截断）。
+/// 不算 SHA-256：1GB 级文件在手机上算一次要几十秒，且镜像改写字节会
+/// 陷入「下完 → 校验失败 → 重下」死循环。真正的损坏会在 llama.cpp
+/// 加载阶段立刻报错。
 library live_translate.core.model.model_catalog;
 
 import 'model_storage.dart';
@@ -124,13 +140,19 @@ class ModelPack {
   }
 }
 
-/// 识别模型选项（按语种区分）
+/// 识别模型选项（**仅中日英**）
 ///
 /// 每一项都对应 sherpa-onnx 官方 HuggingFace 仓库里的一套
 /// `encoder / decoder / joiner / tokens` 四件套。
+///
+/// 已删除：korean / french / german / spanish / russian。
+/// 那些语种的翻译模型根本没训练过，留着只会误导用户。
 enum AsrModelVariant {
-  /// 中英双语（体积/精度平衡，中英混说场景最常用）
+  /// 中英双语（2023 老版，体积/精度平衡，中英混说最常用）
   zhEn,
+
+  /// 中英双语 + 标点（2026-06 新版，480ms 低延迟）
+  zhEnPunct,
 
   /// 中文（2025-06-30 新版权威模型）
   chinese,
@@ -138,53 +160,31 @@ enum AsrModelVariant {
   /// 英语（Kroko 2025-08，比 2023 版更准）
   english,
 
-  /// 韩语专用
-  korean,
-
-  /// 八语种多语言（含日/英/中/俄/泰/越/阿/印尼）
+  /// 多语种（含中/英/日，日语识别用它）
   multilingual,
-
-  /// 法语（Kroko 2025-08）
-  french,
-
-  /// 德语（Kroko 2025-08）
-  german,
-
-  /// 西班牙语（Kroko 2025-08）
-  spanish,
-
-  /// 俄语（Vosk 小模型 int8，体积仅约 28MB）
-  russian,
 }
 
-/// 翻译（MT）权重选项
-///
-/// 全部是 llama.cpp 可直接加载的 GGUF，来源都是模型官方仓库。
+/// 翻译（MT）权重选项 —— 只有两个 StreamRevise 流式模型
 enum MtModelVariant {
-  /// Hy-MT1.5 1.8B Q4_K_M（默认，约 1.06GB）
-  hyMt15Q4,
+  /// Hy-MT2 1.8B StreamRevise v4（约 1.07GB）
+  hyMt2StreamRevise,
 
-  /// Hy-MT1.5 1.8B Q8_0（质量更好，约 1.78GB）
-  hyMt15Q8,
-
-  /// Hy-MT1.5 7B Q4_K_M（质量最好，约 4.31GB，需 8GB 可用内存）
-  hyMt7bQ4,
-
-  /// Qwen2.5 0.5B Instruct Q4_K_M（极轻量通用小模型，约 469MB）
-  qwen25_05b,
+  /// Hy-MT3 1.8B StreamRevise（约 1.13GB，更新版）
+  hyMt3StreamRevise,
 }
 
 /// 提示词模板风格
 ///
-/// 不同翻译模型的指令格式完全不同，写错会直接输出原文或乱码。
+/// 两个 StreamRevise 模型的模板**结构和语言都不同**，必须严格区分：
+/// 用错不会报错，只会输出原文 / 乱码。
 enum MtPromptStyle {
-  /// 混元 Hy-MT1.5 官方模板
-  /// （`<|startoftext|>Translate the following segment into {target},
-  /// without additional explanation.`）
-  hyMt,
+  /// Hy-MT3 StreamRevise：中文标记 + 中文语言名
+  /// （`【背景信息】` / `【待翻译文本】` / `状态：进行中|本句结束`）
+  hyMt3Stream,
 
-  /// ChatML（Qwen 等 instruct 模型通用）
-  chatMl,
+  /// Hy-MT2 StreamRevise v4：英文标记 + 英文语言名
+  /// （`[Background Information]` / `[Source Text]`）
+  hyMt2Stream,
 }
 
 /// 翻译模型规格
@@ -228,90 +228,65 @@ class ModelCatalog {
   );
 
   // ---------------------------------------------------------------------------
-  // 翻译模型（GGUF，llama.cpp 直接加载）
+  // 翻译模型（StreamRevise 流式字幕专用 GGUF）
   // ---------------------------------------------------------------------------
 
-  /// Hy-MT1.5 1.8B Q4_K_M（推荐：体积/质量平衡点）
-  static const RemoteModelFile _hyMt15Q4 = RemoteModelFile(
-    fileName: 'hy-mt1.5-1.8b-q4_k_m.gguf',
-    url: 'https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/'
-        'resolve/main/HY-MT1.5-1.8B-Q4_K_M.gguf',
-    sizeBytes: 1133080512,
+  /// Hy-MT2 1.8B StreamRevise v4（Q4_K_M，约 1.07GB）
+  ///
+  /// 特点：每次 ASR 更新都带上「上一版译文」，模型倾向于沿用正确前缀。
+  /// 提示词用**英文**标记与英文语言名。
+  static const RemoteModelFile _hyMt2StreamRevise = RemoteModelFile(
+    fileName: 'hy-mt2-1.8b-stream-revise-q4_k_m.gguf',
+    url: 'https://huggingface.co/'
+        'febilly/Hy-MT2-1.8B-StreamRevise-v4-GGUF/'
+        'resolve/main/Hy-MT2-1.8B-StreamRevise-v4-Q4_K_M.gguf',
+    sizeBytes: 1069288640,
     role: ModelFileRole.mt,
   );
 
-  /// Hy-MT1.5 1.8B Q8_0（质量更好，内存翻倍）
-  static const RemoteModelFile _hyMt15Q8 = RemoteModelFile(
-    fileName: 'hy-mt1.5-1.8b-q8_0.gguf',
-    url: 'https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/'
-        'resolve/main/HY-MT1.5-1.8B-Q8_0.gguf',
-    sizeBytes: 1908528288,
-    role: ModelFileRole.mt,
-  );
-
-  /// Hy-MT1.5 7B Q4_K_M（旗舰质量，手机上属于「能跑但吃力」）
-  static const RemoteModelFile _hyMt7bQ4 = RemoteModelFile(
-    fileName: 'hy-mt1.5-7b-q4_k_m.gguf',
-    url: 'https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/'
-        'resolve/main/HY-MT1.5-7B-Q4_K_M.gguf',
-    sizeBytes: 4624649312,
-    role: ModelFileRole.mt,
-  );
-
-  /// Qwen2.5 0.5B Instruct Q4_K_M（极轻量，适合低端机 / 只要「够用」）
-  static const RemoteModelFile _qwen25_05b = RemoteModelFile(
-    fileName: 'qwen2.5-0.5b-instruct-q4_k_m.gguf',
-    url: 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/'
-        'resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf',
-    sizeBytes: 491400032,
+  /// Hy-MT3 1.8B StreamRevise（Q4_K_M，约 1.13GB）
+  ///
+  /// 比 v4 更新，加入了「进行中 / 本句结束」的标点控制：
+  /// 半句时不会乱补句号，定稿时才收尾。
+  /// 提示词用**中文**标记与中文语言名。
+  static const RemoteModelFile _hyMt3StreamRevise = RemoteModelFile(
+    fileName: 'hy-mt3-1.8b-stream-revise-q4_k_m.gguf',
+    url: 'https://huggingface.co/'
+        'febilly/Hy-MT3-1.8B-StreamRevise-GGUF/'
+        'resolve/main/Hy-MT3-1.8B-StreamRevise-Q4_K_M.gguf',
+    sizeBytes: 1133080672,
     role: ModelFileRole.mt,
   );
 
   static const Map<MtModelVariant, RemoteModelFile> _mtFiles = {
-    MtModelVariant.hyMt15Q4: _hyMt15Q4,
-    MtModelVariant.hyMt15Q8: _hyMt15Q8,
-    MtModelVariant.hyMt7bQ4: _hyMt7bQ4,
-    MtModelVariant.qwen25_05b: _qwen25_05b,
+    MtModelVariant.hyMt2StreamRevise: _hyMt2StreamRevise,
+    MtModelVariant.hyMt3StreamRevise: _hyMt3StreamRevise,
   };
 
   static const Map<MtModelVariant, MtModelSpec> _mtSpecs = {
-    MtModelVariant.hyMt15Q4: MtModelSpec(
-      variant: MtModelVariant.hyMt15Q4,
-      label: 'Hy-MT1.5 1.8B Q4',
-      description: '约 1.06GB · 推荐。中文翻译质量好，主流手机可流畅运行。',
-      promptStyle: MtPromptStyle.hyMt,
+    MtModelVariant.hyMt2StreamRevise: MtModelSpec(
+      variant: MtModelVariant.hyMt2StreamRevise,
+      label: 'Hy-MT2 1.8B 流式',
+      description: '约 1.07GB · 流式字幕专用，沿用语向更稳，需 2GB 可用内存。',
+      promptStyle: MtPromptStyle.hyMt2Stream,
       minFreeRamBytes: 2 << 30,
     ),
-    MtModelVariant.hyMt15Q8: MtModelSpec(
-      variant: MtModelVariant.hyMt15Q8,
-      label: 'Hy-MT1.5 1.8B Q8',
-      description: '约 1.78GB · 量化损失更小，译文更稳，需 4GB 可用内存。',
-      promptStyle: MtPromptStyle.hyMt,
-      minFreeRamBytes: 4 << 30,
-    ),
-    MtModelVariant.hyMt7bQ4: MtModelSpec(
-      variant: MtModelVariant.hyMt7bQ4,
-      label: 'Hy-MT1.5 7B Q4',
-      description: '约 4.31GB · 质量最好，但需 8GB 以上可用内存，低端机会 OOM。',
-      promptStyle: MtPromptStyle.hyMt,
-      minFreeRamBytes: 8 << 30,
-    ),
-    MtModelVariant.qwen25_05b: MtModelSpec(
-      variant: MtModelVariant.qwen25_05b,
-      label: 'Qwen2.5 0.5B',
-      description: '约 469MB · 极轻量通用小模型，速度快但译文不如专用模型。',
-      promptStyle: MtPromptStyle.chatMl,
-      minFreeRamBytes: 1 << 30,
+    MtModelVariant.hyMt3StreamRevise: MtModelSpec(
+      variant: MtModelVariant.hyMt3StreamRevise,
+      label: 'Hy-MT3 1.8B 流式',
+      description: '约 1.13GB · 最新版，半句不补标点、定稿才收尾，推荐。',
+      promptStyle: MtPromptStyle.hyMt3Stream,
+      minFreeRamBytes: 2 << 30,
     ),
   };
 
   /// 翻译模型规格
   static MtModelSpec mtSpec(MtModelVariant variant) =>
-      _mtSpecs[variant] ?? _mtSpecs[MtModelVariant.hyMt15Q4]!;
+      _mtSpecs[variant] ?? _mtSpecs[MtModelVariant.hyMt3StreamRevise]!;
 
   /// 翻译模型文件
   static RemoteModelFile mtFileFor(MtModelVariant variant) =>
-      _mtFiles[variant] ?? _hyMt15Q4;
+      _mtFiles[variant] ?? _hyMt3StreamRevise;
 
   /// 翻译模型显示名（UI 用）
   static final Map<MtModelVariant, String> mtVariantLabels = {
@@ -323,11 +298,11 @@ class ModelCatalog {
     for (final entry in _mtSpecs.entries) entry.key: entry.value.description,
   };
 
-  /// 兼容旧名：默认翻译模型（Hy-MT1.5 1.8B Q4_K_M）
-  static const RemoteModelFile hyMt15 = _hyMt15Q4;
+  /// 默认翻译模型（Hy-MT3，最新且标点控制更好）
+  static const RemoteModelFile defaultMt = _hyMt3StreamRevise;
 
   // ---------------------------------------------------------------------------
-  // 识别模型（sherpa-onnx zipformer2 transducer 四件套）
+  // 识别模型（sherpa-onnx zipformer transducer 四件套）
   // ---------------------------------------------------------------------------
 
   static const Map<AsrModelVariant, List<RemoteModelFile>> _asrVariants = {
@@ -362,6 +337,44 @@ class ModelCatalog {
             'csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/'
             'resolve/main/tokens.txt',
         sizeBytes: 56317,
+        role: ModelFileRole.asrTokens,
+      ),
+    ],
+    AsrModelVariant.zhEnPunct: [
+      RemoteModelFile(
+        fileName: 'encoder-zh-en-punct-int8.onnx',
+        url: 'https://huggingface.co/'
+            'lorneluo/sherpa-onnx-x-asr-480ms-streaming-zipformer-'
+            'transducer-zh-en-punct-int8-2026-06-05/'
+            'resolve/main/encoder.int8.onnx',
+        sizeBytes: 155278641,
+        role: ModelFileRole.asrEncoder,
+      ),
+      RemoteModelFile(
+        fileName: 'decoder-zh-en-punct.onnx',
+        url: 'https://huggingface.co/'
+            'lorneluo/sherpa-onnx-x-asr-480ms-streaming-zipformer-'
+            'transducer-zh-en-punct-int8-2026-06-05/'
+            'resolve/main/decoder.onnx',
+        sizeBytes: 11309084,
+        role: ModelFileRole.asrDecoder,
+      ),
+      RemoteModelFile(
+        fileName: 'joiner-zh-en-punct-int8.onnx',
+        url: 'https://huggingface.co/'
+            'lorneluo/sherpa-onnx-x-asr-480ms-streaming-zipformer-'
+            'transducer-zh-en-punct-int8-2026-06-05/'
+            'resolve/main/joiner.int8.onnx',
+        sizeBytes: 2581422,
+        role: ModelFileRole.asrJoiner,
+      ),
+      RemoteModelFile(
+        fileName: 'tokens-zh-en-punct.txt',
+        url: 'https://huggingface.co/'
+            'lorneluo/sherpa-onnx-x-asr-480ms-streaming-zipformer-'
+            'transducer-zh-en-punct-int8-2026-06-05/'
+            'resolve/main/tokens.txt',
+        sizeBytes: 58806,
         role: ModelFileRole.asrTokens,
       ),
     ],
@@ -433,40 +446,6 @@ class ModelCatalog {
         role: ModelFileRole.asrTokens,
       ),
     ],
-    AsrModelVariant.korean: [
-      RemoteModelFile(
-        fileName: 'encoder-ko-int8.onnx',
-        url: 'https://huggingface.co/'
-            'k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16/'
-            'resolve/main/encoder-epoch-99-avg-1.int8.onnx',
-        sizeBytes: 126968852,
-        role: ModelFileRole.asrEncoder,
-      ),
-      RemoteModelFile(
-        fileName: 'decoder-ko-int8.onnx',
-        url: 'https://huggingface.co/'
-            'k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16/'
-            'resolve/main/decoder-epoch-99-avg-1.int8.onnx',
-        sizeBytes: 2844692,
-        role: ModelFileRole.asrDecoder,
-      ),
-      RemoteModelFile(
-        fileName: 'joiner-ko-int8.onnx',
-        url: 'https://huggingface.co/'
-            'k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16/'
-            'resolve/main/joiner-epoch-99-avg-1.int8.onnx',
-        sizeBytes: 2581421,
-        role: ModelFileRole.asrJoiner,
-      ),
-      RemoteModelFile(
-        fileName: 'tokens-ko.txt',
-        url: 'https://huggingface.co/'
-            'k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16/'
-            'resolve/main/tokens.txt',
-        sizeBytes: 60246,
-        role: ModelFileRole.asrTokens,
-      ),
-    ],
     AsrModelVariant.multilingual: [
       RemoteModelFile(
         fileName: 'encoder-multi-int8.onnx',
@@ -505,169 +484,24 @@ class ModelCatalog {
         role: ModelFileRole.asrTokens,
       ),
     ],
-    AsrModelVariant.french: [
-      RemoteModelFile(
-        fileName: 'encoder-fr-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06/'
-            'resolve/main/encoder.onnx',
-        sizeBytes: 70092599,
-        role: ModelFileRole.asrEncoder,
-      ),
-      RemoteModelFile(
-        fileName: 'decoder-fr-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06/'
-            'resolve/main/decoder.onnx',
-        sizeBytes: 617488,
-        role: ModelFileRole.asrDecoder,
-      ),
-      RemoteModelFile(
-        fileName: 'joiner-fr-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06/'
-            'resolve/main/joiner.onnx',
-        sizeBytes: 336817,
-        role: ModelFileRole.asrJoiner,
-      ),
-      RemoteModelFile(
-        fileName: 'tokens-fr-kroko.txt',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06/'
-            'resolve/main/tokens.txt',
-        sizeBytes: 5415,
-        role: ModelFileRole.asrTokens,
-      ),
-    ],
-    AsrModelVariant.german: [
-      RemoteModelFile(
-        fileName: 'encoder-de-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/'
-            'resolve/main/encoder.onnx',
-        sizeBytes: 70091557,
-        role: ModelFileRole.asrEncoder,
-      ),
-      RemoteModelFile(
-        fileName: 'decoder-de-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/'
-            'resolve/main/decoder.onnx',
-        sizeBytes: 617489,
-        role: ModelFileRole.asrDecoder,
-      ),
-      RemoteModelFile(
-        fileName: 'joiner-de-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/'
-            'resolve/main/joiner.onnx',
-        sizeBytes: 336817,
-        role: ModelFileRole.asrJoiner,
-      ),
-      RemoteModelFile(
-        fileName: 'tokens-de-kroko.txt',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/'
-            'resolve/main/tokens.txt',
-        sizeBytes: 5606,
-        role: ModelFileRole.asrTokens,
-      ),
-    ],
-    AsrModelVariant.spanish: [
-      RemoteModelFile(
-        fileName: 'encoder-es-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06/'
-            'resolve/main/encoder.onnx',
-        sizeBytes: 154878102,
-        role: ModelFileRole.asrEncoder,
-      ),
-      RemoteModelFile(
-        fileName: 'decoder-es-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06/'
-            'resolve/main/decoder.onnx',
-        sizeBytes: 617488,
-        role: ModelFileRole.asrDecoder,
-      ),
-      RemoteModelFile(
-        fileName: 'joiner-es-kroko.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06/'
-            'resolve/main/joiner.onnx',
-        sizeBytes: 336817,
-        role: ModelFileRole.asrJoiner,
-      ),
-      RemoteModelFile(
-        fileName: 'tokens-es-kroko.txt',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06/'
-            'resolve/main/tokens.txt',
-        sizeBytes: 6385,
-        role: ModelFileRole.asrTokens,
-      ),
-    ],
-    AsrModelVariant.russian: [
-      RemoteModelFile(
-        fileName: 'encoder-ru-vosk-int8.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/'
-            'resolve/main/encoder.int8.onnx',
-        sizeBytes: 26214060,
-        role: ModelFileRole.asrEncoder,
-      ),
-      RemoteModelFile(
-        fileName: 'decoder-ru-vosk.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/'
-            'resolve/main/decoder.onnx',
-        sizeBytes: 2093080,
-        role: ModelFileRole.asrDecoder,
-      ),
-      RemoteModelFile(
-        fileName: 'joiner-ru-vosk-int8.onnx',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/'
-            'resolve/main/joiner.int8.onnx',
-        sizeBytes: 259417,
-        role: ModelFileRole.asrJoiner,
-      ),
-      RemoteModelFile(
-        fileName: 'tokens-ru-vosk.txt',
-        url: 'https://huggingface.co/'
-            'csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-int8-2025-08-16/'
-            'resolve/main/tokens.txt',
-        sizeBytes: 6388,
-        role: ModelFileRole.asrTokens,
-      ),
-    ],
   };
 
   /// 语种显示名
   static const Map<AsrModelVariant, String> asrVariantLabels = {
     AsrModelVariant.zhEn: '中英双语',
+    AsrModelVariant.zhEnPunct: '中英双语（带标点）',
     AsrModelVariant.chinese: '中文',
     AsrModelVariant.english: '英语',
-    AsrModelVariant.korean: '韩语',
-    AsrModelVariant.multilingual: '八语种',
-    AsrModelVariant.french: '法语',
-    AsrModelVariant.german: '德语',
-    AsrModelVariant.spanish: '西班牙语',
-    AsrModelVariant.russian: '俄语',
+    AsrModelVariant.multilingual: '中日英（多语种）',
   };
 
   /// 语种覆盖说明
   static const Map<AsrModelVariant, String> asrVariantDetails = {
-    AsrModelVariant.zhEn: '中文 + 英语混说都行，约 197MB，最推荐',
-    AsrModelVariant.chinese: '纯中文，2025-06-30 新版权威模型，约 167MB',
-    AsrModelVariant.english: '纯英语，Kroko 2025-08 新版，约 68MB',
-    AsrModelVariant.korean: '仅韩语，约 133MB',
-    AsrModelVariant.multilingual:
-        '阿拉伯/英/印尼/日/俄/泰/越/中（不含韩语），约 340MB',
-    AsrModelVariant.french: '纯法语，Kroko 2025-08 版，约 68MB',
-    AsrModelVariant.german: '纯德语，Kroko 2025-08 版，约 68MB',
-    AsrModelVariant.spanish: '纯西班牙语，Kroko 2025-08 版，约 149MB',
-    AsrModelVariant.russian: '纯俄语，Vosk 小模型 int8，约 28MB，最轻',
+    AsrModelVariant.zhEn: '中文 + 英语混说，约 197MB，2023 稳定版',
+    AsrModelVariant.zhEnPunct: '中文 + 英语，480ms 低延迟，自带标点，2026-06 新模型，约 165MB',
+    AsrModelVariant.chinese: '仅中文，2025-06-30 权威版，约 167MB',
+    AsrModelVariant.english: '仅英语，Kroko 2025-08 新版，约 68MB',
+    AsrModelVariant.multilingual: '中日英通用（含日语），约 340MB',
   };
 
   static List<RemoteModelFile> asrFilesFor(AsrModelVariant variant) =>
@@ -678,8 +512,8 @@ class ModelCatalog {
   /// [withTranslation] 为 true 时附带翻译模型（由 [mtVariant] 决定是哪一份）。
   /// [withVad] 为 true 时附带 Silero VAD（+约 630KB）。
   static ModelPack pack({
-    AsrModelVariant variant = AsrModelVariant.zhEn,
-    MtModelVariant mtVariant = MtModelVariant.hyMt15Q4,
+    AsrModelVariant variant = AsrModelVariant.multilingual,
+    MtModelVariant mtVariant = MtModelVariant.hyMt3StreamRevise,
     bool withTranslation = true,
     bool withVad = true,
   }) {
@@ -708,28 +542,15 @@ class ModelCatalog {
   /// 用于「用户先选语言，再一键下载对应模型」的引导流程。
   static AsrModelVariant recommendedFor(String languageCode) {
     switch (languageCode) {
-      case 'ko':
-        return AsrModelVariant.korean;
-      case 'en':
-        return AsrModelVariant.english;
-      case 'fr':
-        return AsrModelVariant.french;
-      case 'de':
-        return AsrModelVariant.german;
-      case 'es':
-        return AsrModelVariant.spanish;
-      case 'ru':
-        return AsrModelVariant.russian;
       case 'ja':
-      case 'th':
-      case 'vi':
-      case 'ar':
-      case 'id':
         return AsrModelVariant.multilingual;
       case 'zh':
         return AsrModelVariant.chinese;
+      case 'en':
+        return AsrModelVariant.english;
       default:
-        return AsrModelVariant.zhEn;
+        // 中日英任意组合场景的默认：多语种模型一套覆盖三种语言
+        return AsrModelVariant.multilingual;
     }
   }
 }

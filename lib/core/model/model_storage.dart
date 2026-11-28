@@ -176,7 +176,10 @@ class ModelStorage {
 
   static const List<String> vadFileNames = [vadFileName];
 
-  static const List<String> mtFileNames = ['hy-mt1.5-1.8b-q4_k_m.gguf'];
+  static const List<String> mtFileNames = [
+    'hy-mt3-1.8b-stream-revise-q4_k_m.gguf',
+    'hy-mt2-1.8b-stream-revise-q4_k_m.gguf',
+  ];
 
   /// 模型分发通道中的代表性文件（用于说明「应有这些角色」）
   static const List<ModelFileSpec> requiredFiles = [
@@ -206,8 +209,8 @@ class ModelStorage {
       kind: ModelKind.vad,
     ),
     ModelFileSpec(
-      fileName: 'hy-mt1.5-1.8b-q4_k_m.gguf',
-      label: 'Hy-MT1.5 翻译模型',
+      fileName: 'hy-mt3-1.8b-stream-revise-q4_k_m.gguf',
+      label: 'Hy-MT3 流式翻译模型',
       kind: ModelKind.mt,
     ),
   ];

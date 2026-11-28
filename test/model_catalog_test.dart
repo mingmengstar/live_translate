@@ -154,23 +154,45 @@ void main() {
       }
     });
 
-    test('Qwen2.5 用 ChatML 模板，混元用自家模板', () {
+    test('两个 StreamRevise 模型各自使用专属模板（混用会输出原文）', () {
+      // v0.8.0：这两个模型的提示词**结构标记与语言名都不同**：
+      // - Hy-MT3 用中文标记 【背景信息】/【待翻译文本】+ 中文语言名；
+      // - Hy-MT2 用英文标记 [Background Information]/[Source Text] + 英文语言名。
+      // 混用不会报错，只会输出原文或乱码 —— 是最难排查的一类问题。
       expect(
-        ModelCatalog.mtSpec(MtModelVariant.qwen25_05b).promptStyle,
-        MtPromptStyle.chatMl,
+        ModelCatalog.mtSpec(MtModelVariant.hyMt3StreamRevise).promptStyle,
+        MtPromptStyle.hyMt3Stream,
       );
-      for (final v in [
-        MtModelVariant.hyMt15Q4,
-        MtModelVariant.hyMt15Q8,
-        MtModelVariant.hyMt7bQ4,
-      ]) {
-        expect(ModelCatalog.mtSpec(v).promptStyle, MtPromptStyle.hyMt,
-            reason: '${v.name} 必须用混元专用模板，否则会输出原文');
-      }
+      expect(
+        ModelCatalog.mtSpec(MtModelVariant.hyMt2StreamRevise).promptStyle,
+        MtPromptStyle.hyMt2Stream,
+      );
     });
 
-    test('兼容旧名 hyMt15 等于默认的 Q4', () {
-      expect(ModelCatalog.hyMt15, ModelCatalog.mtFileFor(MtModelVariant.hyMt15Q4));
+    test('只保留两个 StreamRevise 模型（不再有旧 Hy-MT1.5 / Qwen）', () {
+      expect(MtModelVariant.values.length, 2);
+      final names =
+          MtModelVariant.values.map((v) => ModelCatalog.mtFileFor(v).fileName);
+      expect(
+        names.every((n) => n.contains('stream-revise')),
+        isTrue,
+        reason: '所有翻译模型都必须是 StreamRevise 流式版：$names',
+      );
+    });
+
+    test('翻译模型指向用户指定的两个 HuggingFace 仓库', () {
+      expect(
+        ModelCatalog
+            .mtFileFor(MtModelVariant.hyMt2StreamRevise)
+            .url,
+        contains('febilly/Hy-MT2-1.8B-StreamRevise-v4-GGUF'),
+      );
+      expect(
+        ModelCatalog
+            .mtFileFor(MtModelVariant.hyMt3StreamRevise)
+            .url,
+        contains('febilly/Hy-MT3-1.8B-StreamRevise-GGUF'),
+      );
     });
   });
 
@@ -205,7 +227,7 @@ void main() {
         ModelCatalog.pack(withTranslation: false).id,
         ModelCatalog.pack(withVad: false).id,
         ModelCatalog.pack(variant: AsrModelVariant.english).id,
-        ModelCatalog.pack(mtVariant: MtModelVariant.hyMt7bQ4).id,
+        ModelCatalog.pack(mtVariant: MtModelVariant.hyMt2StreamRevise).id,
       };
       expect(ids.length, 5, reason: 'packId 出现重复：$ids');
     });
@@ -218,8 +240,8 @@ void main() {
     });
 
     test('选择不同 MT 变体时，pack 里带的是对应文件', () {
-      final pack = ModelCatalog.pack(mtVariant: MtModelVariant.qwen25_05b);
-      expect(pack.mtFile!.fileName, contains('qwen2.5'));
+      final pack = ModelCatalog.pack(mtVariant: MtModelVariant.hyMt2StreamRevise);
+      expect(pack.mtFile!.fileName, contains('hy-mt2'));
     });
   });
 
@@ -228,17 +250,24 @@ void main() {
       // 关键：不能把 ja 推荐到 zhEn（中英模型根本认不出日语假名）。
       expect(ModelCatalog.recommendedFor('zh'), AsrModelVariant.chinese);
       expect(ModelCatalog.recommendedFor('en'), AsrModelVariant.english);
-      expect(ModelCatalog.recommendedFor('ko'), AsrModelVariant.korean);
-      expect(ModelCatalog.recommendedFor('fr'), AsrModelVariant.french);
-      expect(ModelCatalog.recommendedFor('de'), AsrModelVariant.german);
-      expect(ModelCatalog.recommendedFor('es'), AsrModelVariant.spanish);
-      expect(ModelCatalog.recommendedFor('ru'), AsrModelVariant.russian);
       expect(ModelCatalog.recommendedFor('ja'), AsrModelVariant.multilingual);
     });
 
-    test('未知语种退回中英双语（不要抛异常）', () {
-      expect(ModelCatalog.recommendedFor('xx'), AsrModelVariant.zhEn);
-      expect(ModelCatalog.recommendedFor(''), AsrModelVariant.zhEn);
+    test('已删除的语种不再被识别（不抛异常，退回默认）', () {
+      // v0.8.0 只保留中日英：ko/fr/de/es/ru 已移除。
+      // 持久化里可能残留这些旧代码，必须能安全降级。
+      for (final removed in ['ko', 'fr', 'de', 'es', 'ru', 'th', 'vi', 'ar']) {
+        expect(
+          () => ModelCatalog.recommendedFor(removed),
+          returnsNormally,
+          reason: '已删除语种 $removed 不能让推荐逻辑抛异常',
+        );
+      }
+    });
+
+    test('未知语种退回默认（不要抛异常）', () {
+      expect(ModelCatalog.recommendedFor('xx'), AsrModelVariant.multilingual);
+      expect(ModelCatalog.recommendedFor(''), AsrModelVariant.multilingual);
     });
   });
 
@@ -313,7 +342,7 @@ void main() {
       // 默认日语会让新用户第一次打开就看到「模型缺失」。
       expect(store.mtTargetLang, 'zh');
       expect(store.asrVariant, AsrModelVariant.zhEn);
-      expect(store.mtVariant, MtModelVariant.hyMt15Q4);
+      expect(store.mtVariant, MtModelVariant.hyMt3StreamRevise);
       expect(store.withVad, isTrue);
     });
 
@@ -334,14 +363,22 @@ void main() {
 
     test('保存时首尾空格被去掉', () async {
       final store = AppSettingsStore.instance;
-      await store.saveLanguages(asrLanguage: '  ko  ');
-      expect(store.asrLanguage, 'ko');
+      await store.saveLanguages(asrLanguage: '  ja  ');
+      expect(store.asrLanguage, 'ja');
+    });
+
+    test('已删除语种写入会被拦下（避免下拉框拿到不存在的值而崩）', () async {
+      final store = AppSettingsStore.instance;
+      // v0.8.0 只保留 zh/en/ja，'ko' 已不在白名单。
+      // 若放进去，DropdownButton 的 value 找不到对应 item 会直接抛断言。
+      await store.saveLanguages(asrLanguage: 'ko');
+      expect(store.asrLanguage, 'en', reason: '未知语种必须退回默认值');
     });
 
     test('saveModelChoice 能独立更新单个字段', () async {
       final store = AppSettingsStore.instance;
-      await store.saveModelChoice(mtVariant: MtModelVariant.qwen25_05b);
-      expect(store.mtVariant, MtModelVariant.qwen25_05b);
+      await store.saveModelChoice(mtVariant: MtModelVariant.hyMt2StreamRevise);
+      expect(store.mtVariant, MtModelVariant.hyMt2StreamRevise);
       // 其他字段不受影响
       expect(store.asrVariant, AsrModelVariant.zhEn);
       expect(store.withVad, isTrue);

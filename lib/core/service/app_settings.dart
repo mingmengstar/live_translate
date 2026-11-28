@@ -48,7 +48,8 @@ class AppSettingsStore {
   static const String defaultMtSourceLang = 'en';
   static const String defaultMtTargetLang = 'zh';
   static const AsrModelVariant defaultAsrVariant = AsrModelVariant.zhEn;
-  static const MtModelVariant defaultMtVariant = MtModelVariant.hyMt15Q4;
+  static const MtModelVariant defaultMtVariant =
+      MtModelVariant.hyMt3StreamRevise;
   static const bool defaultWithVad = true;
 
   // ---- 内存缓存 ----
