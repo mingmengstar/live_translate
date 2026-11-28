@@ -78,9 +78,22 @@ class TranslationService extends ChangeNotifier {
 
   /// 是否正在翻译（避免同一时刻堆积多个推理请求）
   bool _isTranslating = false;
-
   /// 是否正在翻译（诊断 / 测试用）
   bool get isTranslating => _isTranslating;
+
+  /// 当前这一次翻译的代号（每次发起推理自增）
+  ///
+  /// 用来丢弃「已被新识别结果取代的那次推理」迟到的 token。
+  /// 没有它，旧推理的尾部 token 会把新推理刚写上的译文又盖回去，
+  /// 屏幕上的字幕会来回跳。
+  int _mtRunId = 0;
+
+  /// 最近一次已推给界面的「流式部分译文」
+  ///
+  /// 只用于去重：token 级回调里会有大量重复内容（StreamRevise 模型
+  /// 大段沿用上一版译文时尤其明显），不比对就会产生大量无意义的
+  /// setState 与悬浮窗消息。
+  String _lastStreamedPartial = '';
 
   /// 语言设置
   String _asrLanguage = 'en';
@@ -660,6 +673,15 @@ class TranslationService extends ChangeNotifier {
       case OverlayCommand.cyclePosition:
         await _cycleOverlayPosition();
 
+      case OverlayCommand.toggleOrder:
+        // 切换「原文在上 / 译文在上」。overlay 已经先本地生效了，
+        // 这里负责持久化并广播正确值回去。
+        final current = OverlaySettingsStore.instance.current;
+        final next = current.order == SubtitleOrder.sourceFirst
+            ? SubtitleOrder.targetFirst
+            : SubtitleOrder.sourceFirst;
+        await _updateOverlaySettings(current.copyWith(order: next));
+
       case OverlayCommand.hideOverlay:
         // 用户主动收起：只关窗口，服务继续跑
         _overlayDismissedByUser = true;
@@ -1026,9 +1048,19 @@ class TranslationService extends ChangeNotifier {
   /// [isFinal] 为 true 表示 ASR 已定稿，本轮翻译完成后要把这句
   /// 归入「前文上下文」并开启新句。
   Future<void> _translateCurrentSentence({required bool isFinal}) async {
+    // ## 本次翻译的「代号」
+    //
+    // 必须**同步**自增（在任何 await 之前）：ASR 每 ~300ms 就可能来一次新结果，
+    // 两次调用会在 `await mt.cancel()` 处交错。如果等 cancel 之后才取号，
+    // 后发起的那次可能拿到更小的号 —— 于是它的 chunk 会被误判成过期结果，
+    // 把最新的译文盖掉。
+    //
+    // 有了它，`onChunk` 才能判断「这个 chunk 属于已被取代的那次推理」
+    // 并直接丢弃，避免旧 token 打到屏幕上造成字幕倒退。
+    final runId = ++_mtRunId;
+
     final text = _sentenceSource;
     if (text.isEmpty) return;
-
     final mt = _engineManager.currentMT;
     if (mt == null) {
       _isTranslating = false;
@@ -1074,7 +1106,8 @@ class TranslationService extends ChangeNotifier {
         unawaited(
           mt.translateStreamRevise(
             request: request,
-            onChunk: (_) {},
+            onChunk: (chunk) =>
+                _onMTChunk(runId: runId, chunk: chunk, sourceText: text),
             onComplete: (result) {
               if (!completer.isCompleted) completer.complete(result);
             },
@@ -1087,7 +1120,8 @@ class TranslationService extends ChangeNotifier {
         unawaited(
           mt.translateStream(
             text: text,
-            onChunk: (_) {},
+            onChunk: (chunk) =>
+                _onMTChunk(runId: runId, chunk: chunk, sourceText: text),
             onComplete: (result) {
               if (!completer.isCompleted) completer.complete(result);
             },
@@ -1100,7 +1134,7 @@ class TranslationService extends ChangeNotifier {
 
       final result = await completer.future;
       if (result == null) {
-        _isTranslating = false;
+        if (runId == _mtRunId) _isTranslating = false;
         return;
       }
 
@@ -1112,9 +1146,19 @@ class TranslationService extends ChangeNotifier {
         translated = previous;
       }
       if (translated.isEmpty) {
-        _isTranslating = false;
+        if (runId == _mtRunId) _isTranslating = false;
         return;
       }
+
+      // ## 先确认这次结果还「有效」
+      //
+      // 上面的 await 可能已经等了很久，期间新的 ASR 结果完全可能再来一次。
+      // Llama 引擎靠 cancel 抛 TranslationCancelledException 兜住，
+      // 但只要换了引擎实现（Mock / 未来新引擎）就可能没有这层保护 ——
+      // 那样旧结果会直接把用户刚看到的更新译文盖回去。
+      //
+      // 所以出口处必须自己判一次代号，不能依赖引擎的取消语义。
+      if (runId != _mtRunId) return;
 
       // 更新译文链：下一轮请求要带这一版作为 previousTranslation
       _sentenceTranslation = translated;
@@ -1138,6 +1182,9 @@ class TranslationService extends ChangeNotifier {
       if (e is TranslationCancelledException) {
         return;
       }
+      // 过期那次推理的错误与用户无关（它本来就已经被丢弃），
+      // 报出来只会让状态栏闪一条莫名其妙的红字。
+      if (runId != _mtRunId) return;
       _lastError = '翻译错误: $e';
       log(
         '[TranslationService] MT Error: $e\n$stack',
@@ -1145,8 +1192,52 @@ class TranslationService extends ChangeNotifier {
       );
       notifyListeners();
     } finally {
-      _isTranslating = false;
+      // 只有「还是最新那次」才能清标志位。
+      //
+      // 旧推理被新识别结果取代后也会走到 finally，如果无脑清零，
+      // 会把新推理刚设上的 `_isTranslating = true` 抹掉，
+      // 界面的「翻译中」转圈就提前熄火了。
+      if (runId == _mtRunId) _isTranslating = false;
     }
+  }
+
+  /// 接收 MT 的流式 token（`onChunk`）
+  ///
+  /// ## 为什么必须在 token 级接上屏
+  ///
+  /// 以前这里是空实现 `(_) {}`，译文只在**整次生成结束后**才推给界面。
+  /// 一次生成要 prefill + 逐 token decode，1.8B 模型在手机上动辄一两秒，
+  /// 用户看到的就是「一直转圈、字幕半天不出来」。
+  ///
+  /// 接上之后，观感变成「第一个字立刻出现，然后越写越多」，最后整句定稿时
+  /// 再用完整结果覆盖 —— 这正是用户要求的「边识别边部分翻译，
+  /// 整句结束再出完整译文」。
+  ///
+  /// ## 三个必须做的过滤
+  ///
+  /// 1. **过期推理丢弃**：`runId != _mtRunId` 说明这次推理已经被更新的
+  ///    ASR 结果取代。它迟到的 token 会把新译文盖回旧内容，字幕来回跳。
+  /// 2. **重复内容丢弃**：StreamRevise 会大段沿用上一版译文，相邻 chunk
+  ///    常常完全相同。不比对就白刷一遍 UI 与悬浮窗消息。
+  /// 3. **空串丢弃**：模型对极短片段会返回空串（模型卡的已知行为）。
+  void _onMTChunk({
+    required int runId,
+    required MTChunk chunk,
+    required String sourceText,
+  }) {
+    if (runId != _mtRunId) return;
+    final partial = chunk.text.trim();
+    if (partial.isEmpty) return;
+    if (partial == _lastStreamedPartial) return;
+    _lastStreamedPartial = partial;
+    _currentTranslatedPartial = partial;
+    // 走同一条节流链路：悬浮窗与主界面拿到的东西必须与最终结果同源，
+    // 否则会出现「中间态显示了、定稿时却跳一下」的错位。
+    _scheduleDebouncedUpdate(
+      sourceText: sourceText,
+      translatedText: partial,
+      isFinal: false,
+    );
   }
 
   /// 定稿一句：归入前文上下文 + 清空本句状态
@@ -1174,6 +1265,9 @@ class TranslationService extends ChangeNotifier {
     _sentenceFinalized = false;
     _currentPartialText = '';
     _currentTranslatedPartial = '';
+    // 清去重基准：下一句的第一版部分译文即使与这句的最终译文相同，
+    // 也必须能显示出来，否则新句开头会「先空一段」。
+    _lastStreamedPartial = '';
   }
 
   /// 前文上下文（供引擎读取，测试也用它做断言）
@@ -1198,6 +1292,13 @@ class TranslationService extends ChangeNotifier {
     _currentPartialText = '';
     _currentTranslatedPartial = '';
     _isTranslating = false;
+    // 让仍在飞的那次推理彻底作废：它的 token 已经不该上屏。
+    // 不清的话，停止服务后残余 token 还会往缓冲区里补一条字幕。
+    _mtRunId += 1;
+    _lastStreamedPartial = '';
+    _pendingSourceText = '';
+    _pendingTranslatedText = '';
+    _pendingIsFinal = false;
     _debounceTimer?.cancel();
     _debounceTimer = null;
   }
@@ -1247,13 +1348,48 @@ class TranslationService extends ChangeNotifier {
       targetLang: _mtTargetLang,
     );
     
+    // ## 为什么要区分「插入」与「原地更新」
+    //
+    // v0.8.0 之前这里只会 `insert(0, entry)`。字幕只在**整句定稿**时才写一次，
+    // 所以「一句一条」勉强成立。一旦把 MT 的 token 流接上来（每几十毫秒一次），
+    // 同一条字幕会变成几十条历史记录，缓冲区瞬间被一句话塞满，
+    // 用户看到的「字幕历史」全是同一句在滚雪球。
+    //
+    // 现在按顶部条目的状态分流：
+    // - 顶部条目还在进行中（`isFinal == false`）→ 原地替换；
+    // - 顶部条目已定稿，但本次原文与它相同 → 原地替换（把它升级为定稿）；
+    // - 否则 → 这是下一句，插入新条目。
+    //
+    // 第二条不是多余的：定稿时链路会写两次（一次走
+    // `_scheduleDebouncedUpdate(isFinal: true)`，一次走 `_commitSentence()`），
+    // 内容相同。不合并就会插入两条一模一样的字幕 ——
+    // 这正是用户反复报的「同一句重复」。
+    final top = _subtitleBuffer.isEmpty ? null : _subtitleBuffer.first;
+    final replaceTop =
+        top != null && (!top.isFinal || top.sourceText == sourceText);
+
+    if (replaceTop) {
+      // 保留原始时间戳：字幕的「出现时刻」应该是这句第一次露头的时间，
+      // 而不是最后一次 token 刷新的时间，否则历史里每一行都像刚刚才说。
+      _subtitleBuffer[0] = SubtitleEntry(
+        sourceText: sourceText,
+        translatedText: translatedText,
+        timestamp: top.timestamp,
+        isFinal: isFinal,
+        sourceLang: _mtSourceLang,
+        targetLang: _mtTargetLang,
+      );
+      notifyListeners();
+      return;
+    }
+
     _subtitleBuffer.insert(0, entry);
-    
+
     // 限制缓冲区大小
     if (_subtitleBuffer.length > _maxSubtitleEntries) {
       _subtitleBuffer.removeRange(_maxSubtitleEntries, _subtitleBuffer.length);
     }
-    
+
     notifyListeners();
   }
   
@@ -1345,6 +1481,46 @@ class TranslationService extends ChangeNotifier {
     _lastError = null;
   }
   
+  // ---------------------------------------------------------------------------
+  // 仅测试钩子（`@visibleForTesting` 在这里不适用：需要从 test 目录直接调）
+  //
+  // 为什么需要它们：这条链路的真实入口是 ASR 回调，它依赖 sherpa 原生库；
+  // 而 chunk 分发口 `_onMTChunk` / 字幕写入口 `_addSubtitleEntry` 是私有的。
+  // 不想为了可测性把私有成员改成公有（那会让「谁能写字幕」失去约束），
+  // 所以开三个显式、带 debug 前缀的入口。
+  //
+  // 名字一律以 debug 开头：一看就知道不该在业务代码里调。
+  // ---------------------------------------------------------------------------
+
+  /// 当前推理代号（用于测试构造「过期 run」）
+  int get debugCurrentRunId => _mtRunId;
+
+  /// 直接喂一个 MT chunk，走与真实链路完全相同的分发口
+  void debugFeedChunk({
+    required int runId,
+    required String text,
+    required String sourceText,
+  }) {
+    _onMTChunk(
+      runId: runId,
+      chunk: MTChunk(text: text, isFinal: false, chunkIndex: 0),
+      sourceText: sourceText,
+    );
+  }
+
+  /// 直接写一条字幕，走与真实链路完全相同的合并 / 定稿逻辑
+  void debugSeedSubtitle({
+    required String sourceText,
+    required String translatedText,
+    required bool isFinal,
+  }) {
+    _addSubtitleEntry(
+      sourceText: sourceText,
+      translatedText: translatedText,
+      isFinal: isFinal,
+    );
+  }
+
   /// 清空字幕缓冲区
   void clearSubtitles() {
     _subtitleBuffer.clear();

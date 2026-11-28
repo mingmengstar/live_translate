@@ -82,15 +82,26 @@ class MockMT implements MTEngine {
       // 模拟流式输出：分 3 个片段返回
       final chunks = _splitIntoChunks(translatedText, 3);
 
+      // ## chunk.text 必须是「累计文本」，不是本片增量
+      //
+      // 这是 `MTEngine` 接口的既有约定，也是 `LlamaMTEngine` 的实际行为
+      // （它把每个 token 追加进 buffer 后，把整个 buffer 交出去）。
+      //
+      // 为什么必须对齐：上层 `TranslationService._onMTChunk` 直接把
+      // chunk.text 当字幕正文用。Mock 若发增量，两条实现的语义就不一致 ——
+      // 而 Mock 存在的意义正是「接口契约的参考实现」。
+      // 语义一旦分叉，以后照 Mock 写的新引擎会直接错屏。
+      final buffer = StringBuffer();
       for (int i = 0; i < chunks.length; i++) {
         // 模拟网络/推理延迟
         await Future.delayed(Duration(milliseconds: 150 + (i * 50)));
 
         if (!isRunning) break; // 允许取消
 
+        buffer.write(chunks[i]);
         onChunk(
           MTChunk(
-            text: chunks[i],
+            text: buffer.toString(),
             isFinal: i == chunks.length - 1,
             chunkIndex: i,
           ),

@@ -242,6 +242,18 @@ class _OverlayScreenState extends State<OverlayScreen>
     await _sendCommand(OverlayCommand.cycleOpacity);
   }
 
+  /// 切换双语字幕的上下顺序（原文在上 ↔ 译文在上）
+  ///
+  /// 与字号 / 透明度同一套路：先本地生效（立刻看到反馈），
+  /// 再通知主 App 持久化 + 广播，保证窗口重建后顺序不会跳回去。
+  Future<void> _toggleOrder() async {
+    final next = _settings.order == SubtitleOrder.sourceFirst
+        ? SubtitleOrder.targetFirst
+        : SubtitleOrder.sourceFirst;
+    setState(() => _settings = _settings.copyWith(order: next));
+    await _sendCommand(OverlayCommand.toggleOrder);
+  }
+
   /// 切位置
   ///
   /// 本文件**不能**自己关窗重开（会把承载当前 State 的引擎一起拆掉，
@@ -322,6 +334,9 @@ class _OverlayScreenState extends State<OverlayScreen>
   }
 
   /// 内容区：原文 + 译文 / 空状态
+  ///
+  /// 上下顺序由 [OverlaySettings.order] 决定（原文在上 / 译文在上）。
+  /// 两行都缺时显示空状态提示。
   Widget _buildContent() {
     if (_sourceText.isEmpty && _translatedText.isEmpty) {
       return Center(
@@ -342,28 +357,40 @@ class _OverlayScreenState extends State<OverlayScreen>
       );
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (_sourceText.isNotEmpty)
-          _buildTextRow(
+    final sourceRow = _sourceText.isEmpty
+        ? null
+        : _buildTextRow(
             label: '原文',
             text: _sourceText,
             color: Colors.white.withValues(alpha: 0.9),
             icon: Icons.mic_rounded,
             maxLines: 2,
-          ),
-        if (_sourceText.isNotEmpty && _translatedText.isNotEmpty)
-          const SizedBox(height: 6),
-        if (_translatedText.isNotEmpty)
-          _buildTextRow(
+          );
+
+    final targetRow = _translatedText.isEmpty
+        ? null
+        : _buildTextRow(
             label: '译文',
             text: _translatedText,
             color: Colors.blue[100]!,
             icon: Icons.translate_rounded,
             maxLines: 2,
-          ),
-      ],
+          );
+
+    // 按用户设置的顺序排列；只存在一行时不用加分隔间距
+    final rows = <Widget>[];
+    final ordered = _settings.order == SubtitleOrder.targetFirst
+        ? [targetRow, sourceRow]
+        : [sourceRow, targetRow];
+    for (final row in ordered) {
+      if (row == null) continue;
+      if (rows.isNotEmpty) rows.add(const SizedBox(height: 6));
+      rows.add(row);
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: rows,
     );
   }
 
@@ -430,6 +457,12 @@ class _OverlayScreenState extends State<OverlayScreen>
             icon: _positionIcon,
             onTap: _cyclePosition,
             tooltip: '切换位置（当前：${_settings.position.label}）',
+          ),
+          // 双语顺序：原文在上 / 译文在上
+          _buildIconButton(
+            icon: Icons.swap_vert_rounded,
+            onTap: _toggleOrder,
+            tooltip: '切换上下顺序（当前：${_settings.order.label}）',
           ),
           _buildIconButton(
             icon: Icons.visibility_off_rounded,

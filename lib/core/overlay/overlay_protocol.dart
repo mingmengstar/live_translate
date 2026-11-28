@@ -67,6 +67,12 @@ enum OverlayCommand {
   /// 循环切换位置
   cyclePosition,
 
+  /// 切换双语字幕的上下顺序（原文在上 ↔ 译文在上）
+  ///
+  /// 纯渲染顺序，但**仍要回主 App**：主 App 是设置的权威持有者，
+  /// 不回报的话窗口重建后会跳回默认顺序。
+  toggleOrder,
+
   /// overlay 刚起来，请求主 App 把当前设置和状态推过来
   ///
   /// 这条不发，overlay 引擎被系统回收后再重建时，界面会停在默认值
@@ -92,6 +98,8 @@ extension OverlayCommandWire on OverlayCommand {
         return 'cycleOpacity';
       case OverlayCommand.cyclePosition:
         return 'cyclePosition';
+      case OverlayCommand.toggleOrder:
+        return 'toggleOrder';
       case OverlayCommand.requestSync:
         return 'requestSync';
     }

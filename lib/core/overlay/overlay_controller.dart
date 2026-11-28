@@ -149,17 +149,51 @@ class OverlayController {
   }
 
   /// 请求悬浮窗权限（会跳到系统设置页）
+  ///
+  /// ## 为什么会「挂起等用户回来」（BUG-2 修复的关键）
+  ///
+  /// 旧实现发一次 `requestOverlayPermission` 就等返回值。但原生侧现在
+  /// 的行为是「跳系统设置页 → 用户手动开开关 → 回 App 才复查」，
+  /// 所以这里必须在**用户回来之后**再确认一次权限，否则会立刻拿到
+  /// 一个「还没授权」的 false，把用户刚点开的开关判成失败。
+  ///
+  /// 做法：发起请求后轮询 [hasPermission]，最多等 60 秒。
+  /// 这段时间 App 在后台，Dart 定时器依然会跑，回来就能立刻拿到 true。
   Future<bool> requestPermission() async {
     try {
-      final granted = await _permissionChannel
-          .invokeMethod<bool>('requestOverlayPermission');
-      return granted == true;
+      await _permissionChannel.invokeMethod<bool>('requestOverlayPermission');
     } on PlatformException catch (e) {
       log('[Overlay] 请求悬浮窗权限失败: $e', name: 'OverlayController');
       return false;
     } on MissingPluginException {
       return false;
     }
+
+    // 原生侧已经授权（无需跳转）或刚跳转完：先查一次，省掉无谓等待
+    if (await hasPermission()) return true;
+
+    // 等用户去系统设置里打开开关再回来。
+    //
+    // 每 400ms 查一次（不重发请求），最多 60 秒：
+    // - 400ms 足够快，用户一回来就能继续，不会觉得卡住；
+    // - 不用 100ms：设置页期间 App 在后台，频繁跨通道调用没意义。
+    const pollInterval = Duration(milliseconds: 400);
+    const maxWait = Duration(seconds: 60);
+    final deadline = DateTime.now().add(maxWait);
+
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(pollInterval);
+      if (await hasPermission()) {
+        log('[Overlay] 用户已授予悬浮窗权限', name: 'OverlayController');
+        return true;
+      }
+    }
+
+    log(
+      '[Overlay] 等待悬浮窗权限超时（${maxWait.inSeconds}s）',
+      name: 'OverlayController',
+    );
+    return false;
   }
 
   /// 原生侧是否真的认为窗口活着
@@ -296,6 +330,11 @@ class OverlayController {
         width: (size.width * dpr).round(),
         alignment: alignment,
         flag: overlay.OverlayFlag.defaultFlag,
+        // 显式指定通知可见性：插件原生侧 `WindowSetup.setNotificationVisibility`
+        // 直接对传入值调 `name.equalsIgnoreCase(...)`，**没有 null 保护**。
+        // 依赖 Dart 默认值虽然当前可用，但显式传参可以彻底排除
+        // 「原生收到 null → NPE → onCreate 崩溃 → 静默 stopSelf」这条路径。
+        visibility: overlay.NotificationVisibility.visibilitySecret,
         overlayTitle: '实时翻译正在运行',
         overlayContent: '字幕显示中，点字幕条上的按钮可调节',
         enableDrag: false,

@@ -59,7 +59,8 @@ import 'dart:io' show Platform;
 
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
 import 'package:live_translate/core/i18n/language_registry.dart';
-import 'package:live_translate/core/model/model_catalog.dart' show MtPromptStyle;
+import 'package:live_translate/core/model/model_catalog.dart'
+    show ModelCatalog, MtModelVariant, MtPromptStyle;
 import 'package:live_translate/core/model/model_storage.dart';
 
 import 'mt_engine.dart';
@@ -232,6 +233,26 @@ class LlamaMTEngine implements MTEngine {
   /// 当前使用的提示词模板（诊断用）
   MtPromptStyle get promptStyle => _promptStyle;
 
+  /// 权重与提示词模板不匹配的说明（null 表示一致）
+  ///
+  /// 两个 StreamRevise 模型的模板互不兼容：用 A 的模板喂 B 的权重
+  /// 不报错，只会输出原文 / 乱码 / 无限重复。一旦检测到不一致就在这里留话，
+  /// 让上层能直接告诉用户「你选的模型没下载」。
+  String? _modelVariantMismatch;
+
+  /// 权重与提示词模板不匹配的说明（不一致时非 null）
+  String? get modelVariantMismatch => _modelVariantMismatch;
+
+  /// 由**当前模板风格**反推模型变体
+  ///
+  /// 模板风格才是真正喂给模型的东西，所以以它为准反查变体，
+  /// 再取该变体的确切文件名。这样即使调用方只传了 `promptStyle`，
+  /// 也能保证「加载的权重」与「使用的模板」属于同一个模型。
+  MtModelVariant get variantFromStyle => switch (_promptStyle) {
+        MtPromptStyle.hyMt2Stream => MtModelVariant.hyMt2StreamRevise,
+        MtPromptStyle.hyMt3Stream => MtModelVariant.hyMt3StreamRevise,
+      };
+
   /// 仅测试注入用：直接指定模板风格
   ///
   /// 真实路径由 [initialize] 的 `config['promptStyle']` 设置（值来自
@@ -275,15 +296,48 @@ class LlamaMTEngine implements MTEngine {
     };
 
     // 1) 解析权重路径
+    //
+    // ## 必须按「所选变体」解析（P0，译文乱码/重复的根因之一）
+    //
+    // `resolveMtModelPath()` 旧实现返回目录里**第一个** `.gguf`。
+    // 当目录同时存在 Hy-MT2 与 Hy-MT3 两个权重时，用户选的变体
+    // （决定 `_promptStyle`）和实际加载的权重可能**不是同一个模型**，
+    // 于是用 A 的模板喂 B 的权重 —— 不报错，只输出原文/乱码/无限重复。
+    //
+    // 所以这里把「该变体对应的确切文件名」传给存储层，
+    // 并在加载后校验一次，把不匹配状态明确记录下来。
+    final expectedMtFileName =
+        (config['mtFileName'] as String?) ??
+            ModelCatalog.mtFileFor(variantFromStyle).fileName;
+
     _modelPath =
         (config['modelPath'] as String?) ??
         (modelPath != null && modelPath.trim().isNotEmpty
             ? modelPath.trim()
-            : await ModelStorage.instance.resolveMtModelPath());
+            : await ModelStorage.instance.resolveMtModelPath(
+                expectedFileName: expectedMtFileName,
+              ));
 
     if (_modelPath == null || _modelPath!.isEmpty) {
       _lastError = '未检测到翻译模型（*.gguf）';
       throw StateError(_lastError!);
+    }
+
+    // 记录实际加载的文件名，并和所选变体比对。
+    // 不一致说明「用户选的模型没下载、只能退回另一个」，模板会被混用，
+    // 必须让上层能在 UI 上看见，而不是让用户对着乱码猜。
+    final loadedFileName = _modelPath!.split(Platform.pathSeparator).last;
+    if (loadedFileName != expectedMtFileName) {
+      _modelVariantMismatch =
+          '所选模型（$expectedMtFileName）未下载，实际加载 $loadedFileName；'
+          '两套提示词模板不兼容，译文可能异常';
+      log(
+        '[LlamaMT] 权重与提示词模板可能不匹配: '
+        '期望=$expectedMtFileName 实际=$loadedFileName',
+        name: 'LlamaMT',
+      );
+    } else {
+      _modelVariantMismatch = null;
     }
 
     // 2) 上下文参数
@@ -702,9 +756,19 @@ class LlamaMTEngine implements MTEngine {
             case TokenEvent():
               _buffer.write(event.text);
               if (event.text.isEmpty) return;
+              // ## 为什么 chunk 也要过 _stripPromptLeakage
+              //
+              // 这个回调是「边出 token 边上屏」的数据源。以前它是空实现，
+              // 泄漏只能在最终结果里被洗掉；现在中间态会直接显示给用户，
+              // 一旦模型开头吐了 `【待翻译文本】`，用户会在字幕上看到
+              // 半截模板标记再被突然抹掉 —— 观感比不显示还差。
+              //
+              // 清洗是幂等的：没有标记时原样返回，不会破坏正常文本。
+              final partial = _stripPromptLeakage(_buffer.toString());
+              if (partial.isEmpty) return;
               onChunk(
                 MTChunk(
-                  text: _buffer.toString(),
+                  text: partial,
                   isFinal: false,
                   chunkIndex: _buffer.length,
                 ),

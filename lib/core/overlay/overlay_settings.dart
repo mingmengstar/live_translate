@@ -80,12 +80,46 @@ enum SubtitlePosition {
   }
 }
 
+/// 双语字幕的上下顺序
+///
+/// 悬浮窗是「原文 + 译文」两行。哪一行在上面，不同用户习惯完全不同：
+/// - 学语言的人希望「先看原文，再对照译文」→ 原文在上；
+/// - 只看译文的人希望「译文显眼」→ 译文在上。
+///
+/// 这是纯展示偏好，与识别/翻译链路无关，所以只影响渲染顺序。
+enum SubtitleOrder {
+  /// 原文在上，译文在下（默认，符合「读原文再对照」的习惯）
+  sourceFirst,
+
+  /// 译文在上，原文在下（只关注译文时更省眼力）
+  targetFirst;
+
+  String get label {
+    switch (this) {
+      case SubtitleOrder.sourceFirst:
+        return '原文在上';
+      case SubtitleOrder.targetFirst:
+        return '译文在上';
+    }
+  }
+
+  String get wire => name;
+
+  static SubtitleOrder fromWire(String? wire) {
+    for (final o in SubtitleOrder.values) {
+      if (o.wire == wire) return o;
+    }
+    return SubtitleOrder.sourceFirst;
+  }
+}
+
 /// 悬浮窗显示设置
 class OverlaySettings {
   const OverlaySettings({
     this.fontSize = defaultFontSize,
     this.opacity = defaultOpacity,
     this.position = SubtitlePosition.bottom,
+    this.order = SubtitleOrder.sourceFirst,
   });
 
   // ---- 取值范围 ----
@@ -113,15 +147,20 @@ class OverlaySettings {
   final double opacity;
   final SubtitlePosition position;
 
+  /// 双语字幕的上下顺序（原文在上 / 译文在上）
+  final SubtitleOrder order;
+
   OverlaySettings copyWith({
     double? fontSize,
     double? opacity,
     SubtitlePosition? position,
+    SubtitleOrder? order,
   }) {
     return OverlaySettings(
       fontSize: fontSize ?? this.fontSize,
       opacity: opacity ?? this.opacity,
       position: position ?? this.position,
+      order: order ?? this.order,
     );
   }
 
@@ -159,6 +198,7 @@ class OverlaySettings {
         'fontSize': fontSize,
         'opacity': opacity,
         'position': position.wire,
+        'order': order.wire,
       };
 
   /// 从不可信来源解析
@@ -181,6 +221,7 @@ class OverlaySettings {
       fontSize: font,
       opacity: opa,
       position: SubtitlePosition.fromWire(map['position'] as String?),
+      order: SubtitleOrder.fromWire(map['order'] as String?),
     );
   }
 
@@ -189,18 +230,21 @@ class OverlaySettings {
       other is OverlaySettings &&
       (other.fontSize - fontSize).abs() < 0.001 &&
       (other.opacity - opacity).abs() < 0.001 &&
-      other.position == position;
+      other.position == position &&
+      other.order == order;
 
   @override
   int get hashCode => Object.hash(
         fontSize.toStringAsFixed(2),
         opacity.toStringAsFixed(2),
         position,
+        order,
       );
 
   @override
   String toString() =>
-      'OverlaySettings(font=$fontSize, opacity=$opacity, pos=${position.wire})';
+      'OverlaySettings(font=$fontSize, opacity=$opacity, '
+      'pos=${position.wire}, order=${order.wire})';
 }
 
 /// 设置的读写（单例，带内存缓存）
@@ -215,6 +259,7 @@ class OverlaySettingsStore {
   static const String _kFontSize = 'overlay.font_size';
   static const String _kOpacity = 'overlay.opacity';
   static const String _kPosition = 'overlay.position';
+  static const String _kOrder = 'overlay.order';
 
   OverlaySettings _cached = const OverlaySettings();
   bool _loaded = false;
@@ -236,6 +281,7 @@ class OverlaySettingsStore {
         opacity: (prefs.getDouble(_kOpacity) ?? OverlaySettings.defaultOpacity)
             .clamp(OverlaySettings.minOpacity, OverlaySettings.maxOpacity),
         position: SubtitlePosition.fromWire(prefs.getString(_kPosition)),
+        order: SubtitleOrder.fromWire(prefs.getString(_kOrder)),
       );
       _loaded = true;
     } catch (_) {
@@ -255,6 +301,7 @@ class OverlaySettingsStore {
       await prefs.setDouble(_kFontSize, settings.fontSize);
       await prefs.setDouble(_kOpacity, settings.opacity);
       await prefs.setString(_kPosition, settings.position.wire);
+      await prefs.setString(_kOrder, settings.order.wire);
     } catch (_) {
       // 落盘失败只影响下次启动，本次运行不受影响
     }

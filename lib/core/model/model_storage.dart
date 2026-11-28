@@ -351,14 +351,55 @@ class ModelStorage {
   }
 
   /// 查找 MT 权重绝对路径
-  Future<String?> resolveMtModelPath() async {
+  ///
+  /// ## 必须按「用户选定的变体」解析，不能取第一个 .gguf
+  ///
+  /// 旧实现遍历目录、返回**第一个** `.gguf`。这在目录里只有一个权重时
+  /// 看起来正常，但同时存在两个 StreamRevise 权重
+  /// （Hy-MT2 / Hy-MT3，很多用户会都下载来对比）时就会出错：
+  ///
+  /// - 用户界面选的是 Hy-MT3（`promptStyle = hyMt3Stream`，中文标记）；
+  /// - 实际加载的却是按文件名排序在前的 `hy-mt2-...gguf`；
+  /// - 于是用 Hy-MT3 的中文模板去喂 Hy-MT2 权重。
+  ///
+  /// 症状正是历史 BUG「译文是原文 / 乱码 / 无限重复」——
+  /// 两个模型的模板互不兼容，混用不会报错，只会输出垃圾。
+  ///
+  /// ## 为什么用「期望文件名」而不是枚举
+  ///
+  /// `model_catalog.dart` 已经 import 了本文件；这里反向 import 会造成
+  /// 循环依赖。所以由调用方（`LlamaMTEngine`，它本来就 import 了
+  /// `ModelCatalog`）把 `ModelCatalog.mtFileFor(variant).fileName` 传进来。
+  /// 这样「哪个变体对应哪个文件」仍然只有 `ModelCatalog` 一个事实来源。
+  Future<String?> resolveMtModelPath({
+    String? expectedFileName,
+  }) async {
     final status = await inspect();
     if (status.hasError) return null;
+    final dir = status.directoryPath;
+
+    // 1) 优先精确匹配调用方期望的文件名
+    if (expectedFileName != null &&
+        status.presentFiles.contains(expectedFileName)) {
+      return '$dir${Platform.pathSeparator}$expectedFileName';
+    }
+
+    // 2) 该变体不在：如果目录里还有别的 gguf，仍然返回它，
+    //    否则整个引擎直接不可用。上层会据实际文件名做一致性告警。
     for (final name in status.presentFiles) {
       if (isMtFileName(name)) {
-        return '${status.directoryPath}${Platform.pathSeparator}$name';
+        return '$dir${Platform.pathSeparator}$name';
       }
     }
     return null;
+  }
+
+  /// 判断目录里是否存在指定文件名的 MT 权重
+  ///
+  /// 供上层决定要不要提示「当前选择的模型尚未下载」。
+  Future<bool> hasMtFile(String fileName) async {
+    final status = await inspect();
+    if (status.hasError) return false;
+    return status.presentFiles.contains(fileName);
   }
 }

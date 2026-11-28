@@ -131,6 +131,28 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var recordThread: Thread? = null
 
+    /** 请求的目标采样率（ASR 侧固定按 16kHz 解码） */
+    private var targetSampleRate = 16000
+
+    /**
+     * AudioRecord **实际**使用的采样率。
+     *
+     * ## 为什么必须单独记这一项（P0，上一版识别乱码的根因）
+     *
+     * `AudioRecord.Builder` 里 `setSampleRate(16000)` 只是「请求」。
+     * `AudioPlaybackCapture`（系统内录）走的是 AudioFlinger 混音输出，
+     * 硬件通常固定在 48000Hz，部分 ROM 会**静默忽略**我们请求的 16000
+     * 并按 48000 返回数据 —— `record.state` 依然是 INITIALIZED，
+     * 没有任何异常，只有 `record.sampleRate` 会如实反映真实值。
+     *
+     * 后果：把 48kHz 的 PCM 标称成 16kHz 喂给 sherpa-onnx，
+     * 音频在时间轴上被拉长 3 倍（等于 1/3 速慢放），识别器听到的是
+     * 完全失真的信号，于是吐出阿拉伯字母之类的乱码，并"听不全"。
+     *
+     * 所以：**必须读回真实采样率并重采样**，不能相信请求值。
+     */
+    private var actualSampleRate = 16000
+
     @Volatile
     private var recording = false
 
@@ -227,6 +249,7 @@ class AudioCaptureService : Service() {
             Log.i(TAG, "beginCapture: 已在采集中，忽略重复启动")
             return
         }
+        targetSampleRate = if (sampleRate > 0) sampleRate else 16000
         try {
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val projection = manager.getMediaProjection(resultCode, data)
@@ -247,17 +270,17 @@ class AudioCaptureService : Service() {
 
             val format = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(sampleRate)
+                .setSampleRate(targetSampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                 .build()
 
             val minBuffer = AudioRecord.getMinBufferSize(
-                sampleRate,
+                targetSampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
             // 至少 4 × 20ms 的缓冲，避免 read 过短导致丢帧
-            val bufferSize = maxOf(minBuffer, sampleRate / 50 * 2 * 4)
+            val bufferSize = maxOf(minBuffer, targetSampleRate / 50 * 2 * 4)
 
             val record = AudioRecord.Builder()
                 .setAudioFormat(format)
@@ -270,16 +293,30 @@ class AudioCaptureService : Service() {
                 throw IllegalStateException("AudioRecord 初始化失败 state=${record.state}")
             }
 
+            // ---- 关键：读回真实采样率 ----
+            //
+            // 内录路径上系统经常无视请求值（详见 actualSampleRate 注释）。
+            // 这里必须相信 record.sampleRate，而不是我们认为请求成功的 targetSampleRate。
+            actualSampleRate = record.sampleRate.takeIf { it > 0 } ?: targetSampleRate
+
             audioRecord = record
             record.startRecording()
             recording = true
             isCapturing = true
 
-            val chunkBytes = sampleRate / 50 * 2 // 20ms 的 PCM16 单声道
-            recordThread = Thread({ readLoop(record, chunkBytes) }, "LiveTranslate-AudioCapture")
-                .also { it.start() }
+            // 每块的「输出」字节数固定按目标采样率算：20ms 的 PCM16 单声道
+            val chunkBytes = targetSampleRate / 50 * 2
+            recordThread = Thread(
+                { readLoop(record, chunkBytes) },
+                "LiveTranslate-AudioCapture"
+            ).also { it.start() }
 
-            Log.i(TAG, "系统内录已启动: ${sampleRate}Hz mono pcm16, chunk=${chunkBytes}B")
+            Log.i(
+                TAG,
+                "系统内录已启动: 请求=${targetSampleRate}Hz 实际=${actualSampleRate}Hz " +
+                    "mono pcm16, outChunk=${chunkBytes}B, " +
+                    "resample=${actualSampleRate != targetSampleRate}"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "beginCapture 失败: ${e.message}", e)
             releaseAll()
@@ -287,21 +324,110 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun readLoop(record: AudioRecord, chunkBytes: Int) {
-        val buffer = ByteArray(chunkBytes)
+    /**
+     * 采集循环
+     *
+     * 按 **实际采样率** 读取，再重采样到 [targetSampleRate] 后按固定块长
+     * 投递给 Dart 侧。这样 ASR 收到的永远是「20ms @ 16kHz」的规格，
+     * 与它 `acceptWaveform(sampleRate = 16000)` 的声明一致。
+     *
+     * @param outChunkBytes 每次投递的字节数（20ms @ 目标采样率）
+     */
+    private fun readLoop(record: AudioRecord, outChunkBytes: Int) {
+        val srcSamplesPerChunk = (actualSampleRate / 50).coerceAtLeast(1)
+        // 按实际采样率读，留 2 倍余量应对调度抖动
+        val srcBuffer = ShortArray(srcSamplesPerChunk * 2)
+        val pending = ShortArray(outChunkBytes / 2)
+        var pendingCount = 0
+
+        val sameRate = actualSampleRate == targetSampleRate
+        val ratio = actualSampleRate.toDouble() / targetSampleRate.toDouble()
+
+        // 下一个输出样本在「本块源样本」中的位置。
+        // 块结束后减去 read，因此可能为负 —— 负数表示落在
+        // 「上一块最后一个样本 ~ 本块第 0 个样本」之间。
+        var nextSrcPos = 0.0
+        var prevSample = 0
+
         try {
             while (recording) {
-                val read = record.read(buffer, 0, buffer.size)
-                if (read > 0) {
-                    emit(buffer.copyOf(read))
-                } else if (read < 0) {
-                    Log.w(TAG, "AudioRecord.read 错误码: $read")
-                    break
+                val read = record.read(srcBuffer, 0, srcBuffer.size)
+                if (read <= 0) {
+                    if (read < 0) {
+                        Log.w(TAG, "AudioRecord.read 错误码: $read")
+                        break
+                    }
+                    continue
                 }
+
+                if (sameRate) {
+                    // 无需重采样：直接按 outChunkBytes 切块投递
+                    var offset = 0
+                    while (offset < read) {
+                        val take = minOf(pending.size - pendingCount, read - offset)
+                        System.arraycopy(srcBuffer, offset, pending, pendingCount, take)
+                        pendingCount += take
+                        offset += take
+                        if (pendingCount == pending.size) {
+                            emit(shortsToBytes(pending, pending.size))
+                            pendingCount = 0
+                        }
+                    }
+                    continue
+                }
+
+                // ---- 线性插值重采样 ----
+                //
+                // 这是一个标准的「输出驱动 + 相位累加」实现：
+                // nextSrcPos 是下一个输出点在源样本中的浮点位置，
+                // 每输出一个样本前进 ratio 个源样本。
+                while (true) {
+                    val idx: Int
+                    val frac: Double
+                    if (nextSrcPos < 0.0) {
+                        // 落在上一块的尾巴与本块首样本之间
+                        idx = -1
+                        frac = nextSrcPos + 1.0
+                    } else {
+                        idx = nextSrcPos.toInt()
+                        if (idx >= read - 1) break // 本块不够，留给下一块
+                        frac = nextSrcPos - idx
+                    }
+
+                    val a: Int = if (idx < 0) prevSample else srcBuffer[idx].toInt()
+                    val b: Int = if (idx < 0) srcBuffer[0].toInt() else srcBuffer[idx + 1].toInt()
+                    pending[pendingCount++] =
+                        interpolate(a, b, frac).toShort()
+
+                    if (pendingCount == pending.size) {
+                        emit(shortsToBytes(pending, pending.size))
+                        pendingCount = 0
+                    }
+
+                    nextSrcPos += ratio
+                }
+
+                prevSample = srcBuffer[read - 1].toInt()
+                nextSrcPos -= read.toDouble()
             }
         } catch (e: Exception) {
             Log.e(TAG, "读取音频失败: ${e.message}", e)
         }
+    }
+
+    private fun interpolate(a: Int, b: Int, frac: Double): Int {
+        val v = a + (b - a) * frac.coerceIn(0.0, 1.0)
+        return v.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+    }
+
+    private fun shortsToBytes(samples: ShortArray, count: Int): ByteArray {
+        val out = ByteArray(count * 2)
+        for (i in 0 until count) {
+            val s = samples[i].toInt()
+            out[i * 2] = (s and 0xFF).toByte()
+            out[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+        }
+        return out
     }
 
     private fun releaseAll() {

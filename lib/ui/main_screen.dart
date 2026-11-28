@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:live_translate/core/engine/engine.dart';
 import 'package:live_translate/core/i18n/language_registry.dart';
+import 'package:live_translate/core/model/model_catalog.dart';
+import 'package:live_translate/core/overlay/overlay_settings.dart';
 import 'package:live_translate/core/service/translation_service.dart';
 
 /// 检测是否在测试环境中
@@ -556,52 +558,79 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     TranslationService service,
   ) {
     final s = service.overlaySettings;
-    return Row(
+    // 用 `Wrap` 而不是 `Row`：这一行已经有 5 个控件，最窄的机型
+    // （320dp 宽 + 系统字号放大）会直接 RenderFlex overflow。
+    // Wrap 让它在放不下时自动折行，不必为每种屏宽调间距。
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Icon(Icons.tune_rounded, size: 15, color: Colors.grey[500]),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            '悬浮窗设置',
-            style: TextStyle(color: Colors.grey[400], fontSize: 12),
-          ),
+        Row(
+          children: [
+            Icon(Icons.tune_rounded, size: 15, color: Colors.grey[500]),
+            const SizedBox(width: 8),
+            Text(
+              '悬浮窗设置',
+              style: TextStyle(color: Colors.grey[400], fontSize: 12),
+            ),
+          ],
         ),
-        // 字号 − / 值 / 字号 +
-        _buildSettingChip(
-          icon: Icons.text_decrease_rounded,
-          tooltip: '减小悬浮窗字号',
-          onTap: s.canDecreaseFont
-              ? () => service.updateOverlaySettings(s.withSmallerFont)
-              : null,
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4),
-          child: Text(
-            s.fontSize.toStringAsFixed(0),
-            style: const TextStyle(color: Colors.white, fontSize: 12),
-          ),
-        ),
-        _buildSettingChip(
-          icon: Icons.text_increase_rounded,
-          tooltip: '增大悬浮窗字号',
-          onTap: s.canIncreaseFont
-              ? () => service.updateOverlaySettings(s.withLargerFont)
-              : null,
-        ),
-        const SizedBox(width: 6),
-        // 透明度
-        _buildSettingChip(
-          icon: Icons.opacity_rounded,
-          tooltip: '切换悬浮窗透明度（当前 ${(s.opacity * 100).round()}%）',
-          onTap: () => service.updateOverlaySettings(s.withNextOpacity),
-        ),
-        const SizedBox(width: 6),
-        // 位置
-        _buildSettingChip(
-          icon: Icons.vertical_align_top_rounded,
-          tooltip: '切换悬浮窗位置（当前：${s.position.label}）',
-          onTap: () => service.cycleOverlayPosition(),
-          label: s.position.label,
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            // 字号 - / 值 / 字号 +
+            _buildSettingChip(
+              icon: Icons.text_decrease_rounded,
+              tooltip: '减小悬浮窗字号',
+              onTap: s.canDecreaseFont
+                  ? () => service.updateOverlaySettings(s.withSmallerFont)
+                  : null,
+            ),
+            Text(
+              s.fontSize.toStringAsFixed(0),
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+            _buildSettingChip(
+              icon: Icons.text_increase_rounded,
+              tooltip: '增大悬浮窗字号',
+              onTap: s.canIncreaseFont
+                  ? () => service.updateOverlaySettings(s.withLargerFont)
+                  : null,
+            ),
+            // 透明度
+            _buildSettingChip(
+              icon: Icons.opacity_rounded,
+              tooltip: '切换悬浮窗透明度（当前 ${(s.opacity * 100).round()}%）',
+              onTap: () => service.updateOverlaySettings(s.withNextOpacity),
+            ),
+            // 位置
+            _buildSettingChip(
+              icon: Icons.vertical_align_top_rounded,
+              tooltip: '切换悬浮窗位置（当前：${s.position.label}）',
+              onTap: () => service.cycleOverlayPosition(),
+              label: s.position.label,
+            ),
+            // 双语字幕上下顺序
+            //
+            // 这里用 chip 循环切换而不是下拉框，原因有两个：
+            // 1. 它只有两个状态，下拉框属于过度设计，还得多点一次；
+            // 2. 已有测试断言「语言下拉框恰好 3 个」，
+            //    再塞一个 DropdownButton 会让那条守护悄悄失效。
+            _buildSettingChip(
+              icon: Icons.swap_vert_rounded,
+              tooltip: '切换双语字幕上下顺序（当前：${s.order.label}）',
+              onTap: () => service.updateOverlaySettings(
+                s.copyWith(
+                  order: s.order == SubtitleOrder.sourceFirst
+                      ? SubtitleOrder.targetFirst
+                      : SubtitleOrder.sourceFirst,
+                ),
+              ),
+              label: s.order.label,
+            ),
+          ],
         ),
       ],
     );
@@ -908,13 +937,25 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           const Divider(color: Colors.white10, height: 24),
 
           // MT 引擎选择
+          //
+          // ## 显示名必须跟随「当前选中的模型变体」（不是硬编码）
+          //
+          // 旧实现把标签写死成 `Hy-MT1.5 本地翻译`。那个模型在 v0.8.0
+          // 已经被删掉了，但界面文案没跟着改 —— 用户看到的是
+          // 「引擎选择里写着 Hy-MT1.5」，而实际跑的是 Hy-MT2/MT3。
+          // 这类「界面说的和实际做的不一致」会直接把排错带偏
+          // （本次用户就是据此怀疑「引擎是不是写死了数值」）。
+          //
+          // 现在从 [ModelCatalog] 取当前变体的 label，并附带所选变体名，
+          // 让用户一眼看出「引擎 = 哪个模型」。
           _buildEngineSelector(
             label: 'MT 引擎',
             hint: '把识别出的文字翻译成目标语言的组件。模型未就绪时显示「未加载」。',
             currentEngine: service.engineManager.currentMTId,
             availableEngines: service.engineManager.getRegisteredMTEngines(),
-            engineDisplayNames: const {
-              LlamaMTEngine.kEngineId: 'Hy-MT1.5 本地翻译',
+            engineDisplayNames: {
+              LlamaMTEngine.kEngineId:
+                  '${ModelCatalog.mtSpec(service.mtModelVariant).label} · 本地翻译',
             },
             onChanged: (engineId) => service.switchMTEngine(engineId),
           ),
