@@ -291,7 +291,12 @@ jobs:
             exit 1
           fi
           echo "Verifying AOT snapshot in: $ARM64_APK"
-          python3 tools/verify_overlay_aot.py "$ARM64_APK"
+          # `--src-root lib` 让脚本能区分两种失败：
+          #   真回归  → 源码里有、快照里没有 → FAIL（拦构建）
+          #   判据过期 → 源码里也没有（UI 文案改过）→ STALE_WARN（放行 + 警告）
+          # v0.9.2 就是因为少了这个参数，被一条过期判据（`调节透明度`）
+          # 误拦了一次完整构建（其余 7 条判据与 overlayMain 全部命中）。
+          python3 tools/verify_overlay_aot.py "$ARM64_APK" --src-root lib
 
       # 16. 上传构建产物
       - name: Upload APK artifacts

@@ -36,7 +36,13 @@ Dart AOT 会把字符串常量按内容分成两种编码存进快照：
 风险：ASCII 串按 latin-1 搜可能撞上别处的巧合字节。所以下面的
 REQUIRED 以中文串为主（编码唯一、不会误撞），ASCII 串只作补充。
 
-状态：PASS / FAIL / INCONCLUSIVE（脚本没能自证，不能算失败也不能算通过）
+状态：PASS / FAIL / INCONCLUSIVE / STALE_WARN
+
+* `PASS`（0）—— 全部命中，overlay_screen 确已进编译图
+* `FAIL`（1）—— 源码里有但快照里没有 = 真回归，必须修代码
+* `INCONCLUSIVE`（3）—— 对照组没命中，搜索方式本身不可信
+* `STALE_WARN`（0）—— 只有清单过期（源码里也找不到那几条），
+  代码没问题；会打印 GitHub warning，请顺手更新 REQUIRED
 
 用法
 ----
@@ -60,14 +66,29 @@ REQUIRED = [
     ("实时翻译 - 悬浮窗", "overlay_screen.OverlayApp.title"),
     ("减小字号", "overlay_screen 控制栏 tooltip"),
     ("增大字号", "overlay_screen 控制栏 tooltip"),
-    ("调节透明度", "overlay_screen 控制栏 tooltip"),
     # 必须带 U+2026 省略号：`main_screen.dart` 里有个几乎同形的
     # `等待语音输入...`（三个 ASCII 句点）。只写前六个字会命中那份文件，
     # 造成「修复前也 PASS」的假阳性。实测差异就在这个省略号上。
     ("等待语音输入\u2026", "overlay_screen 空状态文案"),
+    # v0.9.2 新增的空状态副信息。选它的理由：整串是**纯字面量**，
+    # 不含任何 `${}` 插值，AOT 里必然以完整常量存在；且只出现在
+    # overlay_screen.dart（main_screen/home_screen 均无此文案），
+    # 一旦 overlay_screen 被编译器跳过，这条会立刻 MISS。
+    ("字幕条已就绪 · 播放任何声音就会出现在这里", "overlay_screen 空状态副信息"),
+    ("到主界面点开始即可出字幕", "overlay_screen 空状态副信息（未运行分支）"),
     ("[Overlay] Lifecycle state", "overlay_screen.didChangeAppLifecycleState"),
     ("[Overlay] Data stream error", "overlay_screen.overlayListener.onError"),
 ]
+
+# ⚠️ 这里曾经有一条 `调节透明度`。v0.9.2 把该 tooltip 改成了
+# 「背景不透明度（当前 xx%）」——**带插值**，AOT 里会被拆成多个片段，
+# 整串搜不到。CI 因此误报 FAIL（其余 7 条全 OK、overlayMain 也 OK，
+# 说明 overlay_screen 确实进了快照，是判据失效而非回归）。
+#
+# 结论（新增判据时必须遵守）：
+# 1. **只挑纯字面量**，绝不要拿含 `${}` 插值的 tooltip 当判据；
+# 2. UI 文案改动时**同步改这份清单**，否则下次构建会以「假失败」方式报警。
+#    改动前先在 lib/ui/overlay_screen.dart 里 grep 一遍字面量是否还在。
 
 # 入口点符号表：这是最直接的判据。
 #
@@ -123,6 +144,49 @@ def load_libapp(apk_path: str, lib_override: str | None) -> bytes:
         return z.read(LIB_PATH_IN_APK)
 
 
+def check_literals_in_source(root: str) -> list[tuple[str, str]]:
+    """检查每条 REQUIRED 判据在本地 lib/ 源码里是否还存在。
+
+    为什么需要这一步
+    ----------------
+    AOT 校验的失败模式有两种，症状完全一样、结论完全相反：
+
+    * **真回归**：源码里有这条字符串，但快照里没有 → overlay_screen
+      没进编译图，必须修代码；
+    * **判据过期**：源码里**已经没有**这条字符串（改了 UI 文案），
+      快照里当然也没有 → 代码没问题，是这份清单该更新了。
+
+    本轮的 FAIL 就是第二种：v0.9.2 把「调节透明度」改成了带插值的
+    「背景不透明度（当前 xx%）」。若不区分，后续每次 UI 改文案都会
+    以「overlay_screen 仍未真正进入 AOT 快照」的红色报错呈现，
+    让人误以为编译图又断了 —— 比不校验更浪费时间。
+
+    返回「在源码里找不到」的判据列表；非空即判 STALE（退出码 4）。
+    """
+    if not root or not os.path.isdir(root):
+        return []
+
+    blobs = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".dart"):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), "r", encoding="utf-8") as f:
+                    blobs.append(f.read())
+            except (OSError, UnicodeDecodeError):
+                continue
+    if not blobs:
+        return []
+
+    haystack = "\n".join(blobs)
+    stale = []
+    for text, origin in REQUIRED:
+        if text not in haystack:
+            stale.append((text, origin))
+    return stale
+
+
 def probe(blob: bytes, text: str) -> tuple[bool, str]:
     """在 AOT 快照里找字符串，返回 (是否命中, 命中的编码)。
 
@@ -162,6 +226,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("apk", help="release APK 路径")
     ap.add_argument("--lib", default=None, help="直接给一个已解压的 libapp.so")
+    ap.add_argument(
+        "--src-root",
+        default=None,
+        help="用于「判据过期」自检的 Dart 源码根目录（通常传 lib）。不传则跳过自检",
+    )
     args = ap.parse_args()
 
     if not args.lib and not os.path.isfile(args.apk):
@@ -212,8 +281,43 @@ def main() -> int:
 
     print()
     if missing:
+        # 先分清是「真回归」还是「判据过期」——两者的处置完全相反，
+        # 混在一起报会让下一次 UI 改文案又变成一次红色构建。
+        stale = check_literals_in_source(args.src_root or "") if args.src_root else []
+        stale_texts = {t for t, _ in stale}
+
+        if args.src_root and missing and all(m in stale_texts for m in missing):
+            # GitHub Actions 注解：让这条警告直接出现在 CI 页面顶部，
+            # 而不是埋在 300 行日志里（本轮就是日志里翻出来的）。
+            joined = ", ".join(repr(t) for t in missing)
+            print(
+                f"::warning title=AOT 判据过期::{len(missing)} 条 REQUIRED "
+                f"在当前源码里已不存在（{joined}），请更新 "
+                f"tools/verify_overlay_aot.py。本次不拦构建。"
+            )
+            print(f"STALE: {len(missing)} 条判据在**当前源码里也不存在**：")
+            for t in missing:
+                print(f"       {t!r}")
+            print("      → 不是回归。UI 文案改过了，是 REQUIRED 清单过期。")
+            print("      → 请把 tools/verify_overlay_aot.py 的 REQUIRED 换成")
+            print("        overlay_screen.dart 里**当前存在的纯字面量**（不要带 ${} 插值）。")
+            # ## 返回 0 而不是非 0（v0.9.3 修正）
+            #
+            # 这个门禁的目的是「发现 overlay_screen 被踢出编译图」。
+            # 既然 REQUIRED 里剩下的判据全部命中、且 overlayMain 也在，
+            # 编译图本身就是好的 —— 只有清单里那几条无效判据在报错。
+            #
+            # 若在此处 return 1，一次 UI 文案改动就会拦下整个 APK，
+            # 代价远大于收益（本轮 v0.9.2 就是这么被误拦的）。
+            # 所以降级为「带 GitHub 警告标注的通过」，并要求同步更新清单。
+            print("RESULT=STALE_WARN")
+            return 0
+
         print(f"FAIL: 仍有 {len(missing)} 条 overlay_screen 字符串不在 libapp.so 里")
         print("      → overlay_screen.dart 仍未真正进入 AOT 快照")
+        if stale:
+            print(f"      注：其中 {len(stale)} 条在当前源码里也不存在，")
+            print("          那几条属于清单过期，需同时更新 REQUIRED。")
         print("RESULT=FAIL")
         return 1
 
