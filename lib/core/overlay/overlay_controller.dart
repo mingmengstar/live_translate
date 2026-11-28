@@ -104,12 +104,27 @@ const double kOverlayMaxWidthDp = 720.0;
 
 /// 确认窗口真的挂上去的轮询参数
 ///
-/// 总等待 1.6s（200ms × 8）。为什么不是更长：
-/// 冷启动 overlayMain 约 5s，但那是**引擎**启动，`addView` 是引擎启动前
-/// 就完成的；正常路径下 200ms 内 `isRunning` 就会是 true。
-/// 等太久会让 UI 卡在「正在显示悬浮窗…」。
-const Duration _kVerifyInterval = Duration(milliseconds: 200);
-const int _kVerifyAttempts = 8;
+/// ## 为什么从 1.6s 改成 12s（v0.9.1，P0）
+///
+/// 旧值是 200ms × 8 = 1.6s，依据是「`addView` 在引擎启动前就完成」。
+/// 那个前提是**错的**，读插件 `OverlayService` 的实际顺序可知：
+///
+/// ```text
+/// onCreate()        <- 这里才去 FlutterEngineCache 取引擎
+///                     取不到就 createAndRunEngine(overlayMain)
+///                     插件自己注释：cold-booting overlayMain (~5s)
+/// onStartCommand()  <- 之后才 isRunning = true / addView()
+/// ```
+///
+/// 也就是说：**引擎没预热成功时，`isRunning` 要等 5s 量级才会变 true**。
+/// `warmUp()` 在 initialize 里是 `unawaited` 的，还可能因为进程被
+/// 低内存回收而失效 —— 真机上「点开始后报 NOT_ATTACHED，但过几秒
+/// 悬浮窗自己冒出来了」就是这个 1.6s 判早了。
+///
+/// 现在等 12s（300ms × 40）：宁可多转几圈圈，也不要误报失败。
+/// 正常路径下第一轮 300ms 内就会命中 true，响应速度没有变差。
+const Duration _kVerifyInterval = Duration(milliseconds: 300);
+const int _kVerifyAttempts = 40;
 
 class OverlayController {
   OverlayController._();
@@ -211,13 +226,35 @@ class OverlayController {
     }
   }
 
+  /// 预热是否已完成（成功或失败都算「已结束」）
+  ///
+  /// 为什么要记这个：`initialize()` 里是 `unawaited(warmUp())`，
+  /// 用户可能在预热还没回来时就点了「开始」。此时直接 `showOverlay()`
+  /// 会走 `OverlayService.onCreate` 的**冷启动分支**（约 5s），
+  /// 体验上就是「点了开始要干等很久」。
+  ///
+  /// 所以 [show] 会先 await 这个 Future（带上限），确保引擎尽量是热的。
+  Future<void>? _warmUpFuture;
+
   /// 预创建悬浮窗引擎（降低首次显示延迟）
   ///
   /// 失败不抛异常：这纯属性能优化，失败也不该阻断主流程。
   Future<void> warmUp() async {
+    final existing = _warmUpFuture;
+    if (existing != null) return existing;
+    final future = _doWarmUp();
+    _warmUpFuture = future;
+    return future;
+  }
+
+  Future<void> _doWarmUp() async {
     try {
       await overlay.FlutterScreenOverlay.warmUp();
+      log('[Overlay] 悬浮窗引擎预热完成', name: 'OverlayController');
     } catch (e) {
+      // 预热失败不影响后续：showOverlay 会走冷启动分支。
+      // 清掉记录，下次还有机会再试一次。
+      _warmUpFuture = null;
       log('[Overlay] warmUp 失败（不影响功能）: $e', name: 'OverlayController');
     }
   }
@@ -345,7 +382,45 @@ class OverlayController {
       //
       // showOverlay 的 success 只代表 Intent 投递成功。这里轮询原生
       // 的 isRunning，只有真的 true 才敢报成功。
-      final mounted = await _waitUntilActive();
+      var mounted = await _waitUntilActive();
+
+      // ---- 自愈重试（v0.9.1）----
+      //
+      // 仍然有一个现实场景：先前的 `OverlayService` 实例卡在某种
+      // 半死状态（isRunning 被上一次 failed addView 置成 false，
+      // 但 Service 本身还活着）。此时 `startService` 只会触发
+      // `onStartCommand` 的「先 detach 再重加」路径，有时并不会
+      // 真正把 isRunning 拉回 true。
+      //
+      // 做法：彻底关一次再开一次。closeOverlay 对不存在的窗口是安全的。
+      if (!mounted) {
+        log(
+          '[Overlay] 首轮未挂载，执行一次关窗重开自愈',
+          name: 'OverlayController',
+        );
+        try {
+          await overlay.FlutterScreenOverlay.closeOverlay();
+        } catch (_) {
+          // 关窗失败不影响重开
+        }
+        try {
+          await overlay.FlutterScreenOverlay.showOverlay(
+            height: (size.height * dpr).round(),
+            width: (size.width * dpr).round(),
+            alignment: alignment,
+            flag: overlay.OverlayFlag.defaultFlag,
+            visibility: overlay.NotificationVisibility.visibilitySecret,
+            overlayTitle: '实时翻译正在运行',
+            overlayContent: '字幕显示中，点字幕条上的按钮可调节',
+            enableDrag: false,
+            wakeScreen: false,
+          );
+          mounted = await _waitUntilActive();
+        } catch (e) {
+          log('[Overlay] 自愈重开失败: $e', name: 'OverlayController');
+        }
+      }
+
       if (!mounted) {
         _isShowing = false;
         log(

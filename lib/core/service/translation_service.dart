@@ -1040,7 +1040,69 @@ class TranslationService extends ChangeNotifier {
     _currentPartialText = text;
     _sentenceSource = text;
 
-    unawaited(_translateCurrentSentence(isFinal: result.isFinal));
+    _enqueueTranslation(isFinal: result.isFinal);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 单飞翻译调度（v0.9.1）
+  // ---------------------------------------------------------------------------
+  //
+  // ## 为什么必须单飞
+  //
+  // 旧实现是「每次 ASR 文本变化 -> 立即 cancel 上一次 -> 立刻发起新的」。
+  // 在桌面上这没问题，但在手机上这是灾难：
+  //
+  // 1. 1.8B 模型处理一个带背景信息 + 上一版译文的 prompt，prefill 在
+  //    手机 4 线程上要好几秒；ASR 每 ~300ms 就来一次新结果，
+  //    于是**每一次都会在 prefill 阶段被打断**，一次完整推理都跑不完。
+  // 2. `cancel()` 内部只等 5s 就放弃（见 `LlamaMTEngine.cancel`），
+  //    prefill 超过 5s 时它直接返回，新请求立刻 `session.generate()`，
+  //    而 worker 侧的 `inFlightGenerateId` 还没清空 ->
+  //    llama.cpp 直接报 `another generate is already in flight`。
+  //    这就是真机「最后错误: LlamaLibraryException: anot...」的来源。
+  // 3. MT 反复抢 CPU 还会把 ASR isolate 挤到几乎没时间片，
+  //    音频积压 -> 端点检测失效 -> 「说了一大段只识别出一句」。
+  //
+  // 现在改成**单飞 + 最新优先**：
+  //   - 同一时刻只允许一次 MT 推理；
+  //   - 推理期间来的新文本只覆盖「待办槽位」，不打断正在跑的那次；
+  //   - 当前推理一结束，立刻用最新文本再跑一次。
+  //
+  // 代价是「中间态比 ASR 慢一拍」，但换来的是**推理能真正跑完**，
+  // 而且不会再和 llama.cpp 的并发闸门打架。
+  bool _mtLoopRunning = false;
+  bool _queuedHasWork = false;
+  String _queuedText = '';
+  bool _queuedIsFinal = false;
+
+  /// 把「翻译当前句」排进待办（最新优先，不打断在跑的推理）
+  void _enqueueTranslation({required bool isFinal}) {
+    // 定稿请求一旦入队，后续迟到的中间结果不得覆盖它的文本。
+    if (_queuedIsFinal && !isFinal) return;
+
+    _queuedText = _sentenceSource;
+    _queuedHasWork = true;
+    if (isFinal) _queuedIsFinal = true;
+    unawaited(_drainTranslationQueue());
+  }
+
+  /// 单飞执行队列：同一时刻只有一条推理在跑
+  Future<void> _drainTranslationQueue() async {
+    if (_mtLoopRunning) return;
+    _mtLoopRunning = true;
+    try {
+      while (_queuedHasWork) {
+        _queuedHasWork = false;
+        final text = _queuedText;
+        final isFinal = _queuedIsFinal;
+        _queuedIsFinal = false;
+        if (text.isEmpty) continue;
+        _sentenceSource = text;
+        await _translateCurrentSentence(isFinal: isFinal);
+      }
+    } finally {
+      _mtLoopRunning = false;
+    }
   }
 
   /// 翻译「当前句」的最新版本
@@ -1067,11 +1129,12 @@ class TranslationService extends ChangeNotifier {
       return;
     }
 
-    // 取消上一次未完成的推理（最新优先）
-    if (mt is LlamaMTEngine) {
-      await mt.cancel();
-    }
-
+    // v0.9.1：这里**不再** cancel 上一次推理。
+    //
+    // 单飞调度（_drainTranslationQueue）保证同一时刻只有一条推理在跑，
+    // 走到这里时上一条必然已经结束。再 cancel 一次不仅没必要，
+    // 还会在「prefill 超过 cancel 的 5s 等待」时把新请求推进
+    // llama.cpp 的并发闸门 -> `another generate is already in flight`。
     _isTranslating = true;
     final previous = _sentenceTranslation;
     final previousSource = _sentencePreviousSource;
@@ -1301,6 +1364,20 @@ class TranslationService extends ChangeNotifier {
     _pendingIsFinal = false;
     _debounceTimer?.cancel();
     _debounceTimer = null;
+
+    // v0.9.1：连待办队列一起清。
+    // 不清的话，停止服务后队列里残留的那条会被下一轮 startService
+    // 的 loop 捡起来，把上一轮的句子翻译到新一轮的字幕里。
+    _queuedHasWork = false;
+    _queuedText = '';
+    _queuedIsFinal = false;
+
+    // 让仍在跑的那次推理彻底作废。
+    // 不能 await：本方法被同步路径（stopService 的 catch 分支）调用。
+    final mt = _engineManager.currentMT;
+    if (mt is LlamaMTEngine) {
+      unawaited(mt.cancel());
+    }
   }
 
   /// ASR 错误回调

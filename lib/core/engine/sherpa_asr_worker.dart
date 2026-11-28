@@ -61,6 +61,10 @@ void sherpaAsrWorkerEntry(SendPort parent) {
         final pcm = msg['pcm'];
         if (pcm is Uint8List && state != null) {
           state!.feed(pcm, sender!);
+          // 回报「这一块已经解码完」：宿主侧用它判断
+          // 「停止时队列里还有多少音频没消化」，避免粗暴丢弃积压
+          // （v0.9.1，「说了一大段只识别出一句」的直接原因）。
+          sender!.send({'type': 'consumed', 'bytes': pcm.length});
         }
         break;
 

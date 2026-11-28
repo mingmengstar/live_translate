@@ -823,6 +823,13 @@ class LlamaMTEngine implements MTEngine {
     } catch (e, s) {
       _lastError = '翻译失败: $e';
       log('[LlamaMT] 翻译失败: $e\n$s', name: 'LlamaMT');
+      // llama.cpp worker 的并发闸门：上一轮在原生侧还没退出时不接受新请求。
+      // 这不是「翻译失败」，而是「这一次撞车了」。用专门的异常类型透出，
+      // 让上层能静默丢弃并等下一次识别结果，而不是往界面甩一条红字。
+      if (e.toString().contains('already in flight')) {
+        onError(const TranslationCancelledException(), StackTrace.current);
+        return;
+      }
       onError(e, s);
     } finally {
       _activeSub = null;
@@ -939,12 +946,27 @@ class LlamaMTEngine implements MTEngine {
     }
 
     // 等 finally 真正收尾（含 isRunning=false），避免 KV cache 竞态
+    //
+    // ## 为什么从 5s 提到 30s（v0.9.1）
+    //
+    // 5s 太短了。1.8B 模型处理带背景信息 + 上一版译文的 prompt，
+    // prefill 在手机 4 线程上就可能在 5s 量级；一旦超时，
+    // 这里直接返回，调用方立刻 `session.generate()`，
+    // 而 worker 侧 `inFlightGenerateId` 还没清空 ->
+    // llama.cpp 报 `another generate is already in flight`，
+    // 译文直接丢失。真机上「最后错误: LlamaLibraryException: anot...」
+    // 就是这个超时造成的。
+    //
+    // 宁愿多等一会，也不要撞并发闸门：上层已经改成单飞调度，
+    // 这里等久一点不会拖慢字幕（本来就没有并发请求在排）。
     final inflight = _inflight;
     if (inflight != null) {
       try {
-        await inflight.timeout(const Duration(seconds: 5));
+        await inflight.timeout(const Duration(seconds: 30));
       } catch (_) {
-        // 收尾超时也不阻塞新请求：宁可多一次 clear，不要卡死字幕
+        // 真的 30s 还没收尾，说明这次生成卡在原生侧了。
+        // 打一条日志便于定位，但仍然继续，避免永久阻塞字幕链路。
+        log('cancel 等待生成收尾超时（30s），继续后续流程', name: 'LlamaMT');
       }
     }
   }

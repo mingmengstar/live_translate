@@ -83,6 +83,13 @@ class SherpaASREngine implements ASREngine {
   /// 已投递的音频字节数（诊断用）
   int _pushedBytes = 0;
 
+  /// worker 已经真正解码完的字节数
+  ///
+  /// 与 [_pushedBytes] 的差就是「投递进 isolate 消息队列但还没被处理」
+  /// 的积压量。停止服务时必须等它追平，否则那段音频会被整块丢弃 ——
+  /// 这正是「说了一大段只识别出一句」的成因（v0.9.1）。
+  int _decodedBytes = 0;
+
   /// 模型路径（initialize 时解析）
   String? _encoderPath;
   String? _decoderPath;
@@ -231,6 +238,10 @@ class SherpaASREngine implements ASREngine {
               _onError?.call(StateError(message), StackTrace.current);
               break;
 
+            case 'consumed':
+              _decodedBytes += (msg['bytes'] as num?)?.toInt() ?? 0;
+              break;
+
             case 'done':
               break;
 
@@ -267,6 +278,7 @@ class SherpaASREngine implements ASREngine {
     _onError = onError;
     isRunning = true;
     _pushedBytes = 0;
+    _decodedBytes = 0;
     log('[SherpaASR] 开始识别', name: 'SherpaASR');
   }
 
@@ -275,12 +287,44 @@ class SherpaASREngine implements ASREngine {
     if (!isRunning) return;
     isRunning = false;
 
-    // 通知 worker 吐出尾包，并给一点时间把最后一句回传上来
+    // 通知 worker 吐出尾包，并等它把积压音频真正处理完
+    //
+    // ## 为什么从 120ms 改成「分段轮询等」（v0.9.1）
+    //
+    // 120ms 远远不够。真机上 MT 推理会和 ASR 抢 CPU，
+    // ASR isolate 的消息队列里可能积压了几秒甚至几十秒的音频。
+    // 旧实现发完 `flush` 只等 120ms 就返回，上层紧接着就 teardown
+    // isolate —— 队列里那些**还没解码的音频被整块扔掉**。
+    //
+    // 表现出来就是用户说的「我这么长一段语音，他就检测到这么一点」。
+    //
+    // 现在给足时间（最多 3s，每 100ms 探一次已投递字节数是否还在推进），
+    // 一旦 worker 追上实时位置就立刻返回，不会平白拖慢停止流程。
     final port = _workerPort;
     if (port != null) {
       try {
+        final settled = _decodedBytes >= _pushedBytes;
         port.send({'type': 'flush'});
-        await Future<void>.delayed(const Duration(milliseconds: 120));
+        if (!settled) {
+          // 有积压：等 worker 追上来
+          final deadline = DateTime.now().add(const Duration(seconds: 3));
+          var lastSeen = -1;
+          var stallRounds = 0;
+          while (DateTime.now().isBefore(deadline)) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+            if (_decodedBytes >= _pushedBytes) break;
+            // 连续 8 轮（800ms）没有任何进展 → worker 真的卡了，别再等
+            if (_decodedBytes == lastSeen) {
+              stallRounds++;
+              if (stallRounds >= 8) break;
+            } else {
+              stallRounds = 0;
+              lastSeen = _decodedBytes;
+            }
+          }
+        } else {
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+        }
       } catch (_) {
         // 忽略
       }
